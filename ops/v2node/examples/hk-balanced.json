@@ -1,0 +1,26 @@
+{
+  "Log": {
+    "Level": "error",
+    "Output": "/var/log/v2node/v2node-20.log",
+    "Access": "none",
+    "MaxSizeMB": 80,
+    "MaxBackups": 3
+  },
+  "ConnectionConfig": {
+    "handshake": 4,
+    "connIdle": 180,
+    "uplinkOnly": 2,
+    "downlinkOnly": 5,
+    "statsUserUplink": true,
+    "statsUserDownlink": true,
+    "bufferSize": 128
+  },
+  "Nodes": [
+    {
+      "ApiHost": "https://node.eatp.top",
+      "ApiKey": "CHANGE_ME",
+      "NodeID": 20,
+      "Timeout": 30
+    }
+  ]
+}

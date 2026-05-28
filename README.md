@@ -33,3 +33,7 @@ It also adds file log rotation when `Log.Output` is set:
 ```
 
 NodePulse remains responsible for `/api/v2/server/config.routes`; runtime connection and process log policy are written into the host-local v2node config JSON during deployment.
+
+Production deployment fetches that host-local runtime JSON from NodePulse:
+
+`/api/v2/server/local_config?node_type=v2node&node_id=<id>&token=<token>`

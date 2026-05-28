@@ -1,0 +1,248 @@
+﻿diff --git a/cmd/server.go b/cmd/server.go
+index da51e54..9e82ee3 100644
+--- a/cmd/server.go
++++ b/cmd/server.go
+@@ -2,6 +2,7 @@ package cmd
+ 
+ import (
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	_ "net/http/pprof"
+ 	"os"
+@@ -22,6 +23,89 @@ var (
+ 	watch  bool
+ )
+ 
++type rotatingLogWriter struct {
++	path      string
++	maxSize   int64
++	maxBackup int
++	file      *os.File
++}
++
++func newRotatingLogWriter(path string, maxSizeMB int, maxBackups int) (*rotatingLogWriter, error) {
++	if maxSizeMB <= 0 {
++		maxSizeMB = 100
++	}
++	if maxBackups <= 0 {
++		maxBackups = 3
++	}
++	writer := &rotatingLogWriter{
++		path:      path,
++		maxSize:   int64(maxSizeMB) * 1024 * 1024,
++		maxBackup: maxBackups,
++	}
++	return writer, writer.open()
++}
++
++func (w *rotatingLogWriter) open() error {
++	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++	if err != nil {
++		return err
++	}
++	w.file = file
++	return nil
++}
++
++func (w *rotatingLogWriter) Write(p []byte) (int, error) {
++	if w.file == nil {
++		if err := w.open(); err != nil {
++			return 0, err
++		}
++	}
++	if info, err := w.file.Stat(); err == nil && info.Size()+int64(len(p)) > w.maxSize {
++		if err := w.rotate(); err != nil {
++			return 0, err
++		}
++	}
++	return w.file.Write(p)
++}
++
++func (w *rotatingLogWriter) Close() error {
++	if w.file == nil {
++		return nil
++	}
++	return w.file.Close()
++}
++
++func (w *rotatingLogWriter) rotate() error {
++	if w.file != nil {
++		_ = w.file.Close()
++		w.file = nil
++	}
++	for i := w.maxBackup - 1; i >= 1; i-- {
++		oldPath := fmt.Sprintf("%s.%d", w.path, i)
++		newPath := fmt.Sprintf("%s.%d", w.path, i+1)
++		if _, err := os.Stat(oldPath); err == nil {
++			_ = os.Rename(oldPath, newPath)
++		}
++	}
++	if _, err := os.Stat(w.path); err == nil {
++		_ = os.Rename(w.path, fmt.Sprintf("%s.1", w.path))
++	}
++	return w.open()
++}
++
++func configureLogOutput(logConfig conf.LogConfig) io.Closer {
++	if logConfig.Output == "" {
++		return nil
++	}
++	writer, err := newRotatingLogWriter(logConfig.Output, logConfig.MaxSizeMB, logConfig.MaxBackups)
++	if err != nil {
++		log.WithField("err", err).Error("Open log file failed, using stdout instead")
++		return nil
++	}
++	log.SetOutput(writer)
++	return writer
++}
++
+ var serverCommand = cobra.Command{
+ 	Use:   "server",
+ 	Short: "Run v2node server",
+@@ -62,12 +146,9 @@ func serverHandle(_ *cobra.Command, _ []string) {
+ 	case "error":
+ 		log.SetLevel(log.ErrorLevel)
+ 	}
+-	if c.LogConfig.Output != "" {
+-		f, err := os.OpenFile(c.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+-		if err != nil {
+-			log.WithField("err", err).Error("Open log file failed, using stdout instead")
+-		}
+-		log.SetOutput(f)
++	logCloser := configureLogOutput(c.LogConfig)
++	if logCloser != nil {
++		defer logCloser.Close()
+ 	}
+ 	// Enable pprof if configured
+ 	if c.PprofPort != 0 {
+@@ -169,15 +250,15 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
+ 		log.SetLevel(log.ErrorLevel)
+ 	}
+ 	if newConf.LogConfig.Output != "" {
+-		f, err := os.OpenFile(newConf.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
++		writer, err := newRotatingLogWriter(newConf.LogConfig.Output, newConf.LogConfig.MaxSizeMB, newConf.LogConfig.MaxBackups)
+ 		if err != nil {
+ 			log.WithField("err", err).Error("Open log file failed, using stdout instead")
+ 		} else {
+ 			// 关闭旧的日志文件（如果是文件）
+-			if oldWriter, ok := log.StandardLogger().Out.(*os.File); ok && oldWriter != os.Stdout && oldWriter != os.Stderr {
++			if oldWriter, ok := log.StandardLogger().Out.(io.Closer); ok && oldWriter != os.Stdout && oldWriter != os.Stderr {
+ 				oldWriter.Close()
+ 			}
+-			log.SetOutput(f)
++			log.SetOutput(writer)
+ 		}
+ 	}
+ 
+diff --git a/conf/conf.go b/conf/conf.go
+index fb80567..cf3a3f5 100644
+--- a/conf/conf.go
++++ b/conf/conf.go
+@@ -11,15 +11,28 @@ const DefaultNodeRetryCount = 1
+ const DefaultNodeTimeout = 15
+ 
+ type Conf struct {
+-	LogConfig   LogConfig    `mapstructure:"Log"`
+-	NodeConfigs []NodeConfig `mapstructure:"Nodes"`
+-	PprofPort   int          `mapstructure:"PprofPort"`
++	LogConfig        LogConfig        `mapstructure:"Log"`
++	ConnectionConfig ConnectionConfig `mapstructure:"ConnectionConfig"`
++	NodeConfigs      []NodeConfig     `mapstructure:"Nodes"`
++	PprofPort        int              `mapstructure:"PprofPort"`
+ }
+ 
+ type LogConfig struct {
+-	Level  string `mapstructure:"Level"`
+-	Output string `mapstructure:"Output"`
+-	Access string `mapstructure:"Access"`
++	Level      string `mapstructure:"Level"`
++	Output     string `mapstructure:"Output"`
++	Access     string `mapstructure:"Access"`
++	MaxSizeMB  int    `mapstructure:"MaxSizeMB"`
++	MaxBackups int    `mapstructure:"MaxBackups"`
++}
++
++type ConnectionConfig struct {
++	Handshake         uint32 `mapstructure:"handshake"`
++	ConnIdle          uint32 `mapstructure:"connIdle"`
++	UplinkOnly        uint32 `mapstructure:"uplinkOnly"`
++	DownlinkOnly      uint32 `mapstructure:"downlinkOnly"`
++	StatsUserUplink   *bool  `mapstructure:"statsUserUplink"`
++	StatsUserDownlink *bool  `mapstructure:"statsUserDownlink"`
++	BufferSize        int32  `mapstructure:"bufferSize"`
+ }
+ 
+ type NodeConfig struct {
+@@ -33,9 +46,18 @@ type NodeConfig struct {
+ func New() *Conf {
+ 	return &Conf{
+ 		LogConfig: LogConfig{
+-			Level:  "info",
+-			Output: "",
+-			Access: "none",
++			Level:      "info",
++			Output:     "",
++			Access:     "none",
++			MaxSizeMB:  100,
++			MaxBackups: 3,
++		},
++		ConnectionConfig: ConnectionConfig{
++			Handshake:    4,
++			ConnIdle:     120,
++			UplinkOnly:   2,
++			DownlinkOnly: 4,
++			BufferSize:   128,
+ 		},
+ 	}
+ }
+diff --git a/core/core.go b/core/core.go
+index c9de9ee..2cbaeb9 100644
+--- a/core/core.go
++++ b/core/core.go
+@@ -94,14 +94,38 @@ func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
+ 	var inBoundConfig []*core.InboundHandlerConfig
+ 
+ 	// Policy config
++	connectionConfig := c.ConnectionConfig
++	statsUserUplink := true
++	if connectionConfig.StatsUserUplink != nil {
++		statsUserUplink = *connectionConfig.StatsUserUplink
++	}
++	statsUserDownlink := true
++	if connectionConfig.StatsUserDownlink != nil {
++		statsUserDownlink = *connectionConfig.StatsUserDownlink
++	}
++	if connectionConfig.Handshake == 0 {
++		connectionConfig.Handshake = 4
++	}
++	if connectionConfig.ConnIdle == 0 {
++		connectionConfig.ConnIdle = 120
++	}
++	if connectionConfig.UplinkOnly == 0 {
++		connectionConfig.UplinkOnly = 2
++	}
++	if connectionConfig.DownlinkOnly == 0 {
++		connectionConfig.DownlinkOnly = 4
++	}
++	if connectionConfig.BufferSize == 0 {
++		connectionConfig.BufferSize = 128
++	}
+ 	levelPolicyConfig := &coreConf.Policy{
+-		StatsUserUplink:   true,
+-		StatsUserDownlink: true,
+-		Handshake:         proto.Uint32(4),
+-		ConnectionIdle:    proto.Uint32(120),
+-		UplinkOnly:        proto.Uint32(2),
+-		DownlinkOnly:      proto.Uint32(4),
+-		BufferSize:        proto.Int32(128),
++		StatsUserUplink:   statsUserUplink,
++		StatsUserDownlink: statsUserDownlink,
++		Handshake:         proto.Uint32(connectionConfig.Handshake),
++		ConnectionIdle:    proto.Uint32(connectionConfig.ConnIdle),
++		UplinkOnly:        proto.Uint32(connectionConfig.UplinkOnly),
++		DownlinkOnly:      proto.Uint32(connectionConfig.DownlinkOnly),
++		BufferSize:        proto.Int32(connectionConfig.BufferSize),
+ 	}
+ 	corePolicyConfig := &coreConf.PolicyConfig{}
+ 	corePolicyConfig.Levels = map[uint32]*coreConf.Policy{0: levelPolicyConfig}

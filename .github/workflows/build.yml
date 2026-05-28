@@ -1,0 +1,99 @@
+name: Build NodePulse v2node
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build.yml"
+      - "ops/v2node/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: linux-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+          - arch: arm64
+            goarch: arm64
+    steps:
+      - name: Checkout NodePulse patch repo
+        uses: actions/checkout@v4
+        with:
+          path: nodepulse-v2node
+
+      - name: Checkout upstream v2node
+        uses: actions/checkout@v4
+        with:
+          repository: wyx2685/v2node
+          path: v2node
+          submodules: recursive
+
+      - name: Apply NodePulse patches
+        working-directory: v2node
+        run: |
+          set -euo pipefail
+          for patch in ../nodepulse-v2node/ops/v2node/patches/*.patch; do
+            echo "Applying ${patch}"
+            git apply --whitespace=fix "${patch}"
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: v2node/go.mod
+          cache-dependency-path: v2node/go.sum
+
+      - name: Build
+        working-directory: v2node
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          GOEXPERIMENT: jsonv2
+        run: |
+          set -euo pipefail
+          upstream_sha="$(git rev-parse --short HEAD)"
+          patch_sha="$(git -C ../nodepulse-v2node rev-parse --short HEAD)"
+          version="nodepulse-${upstream_sha}-${patch_sha}"
+          mkdir -p ../dist
+          go build -v -trimpath \
+            -ldflags "-X 'github.com/wyx2685/v2node/cmd.version=${version}' -s -w -buildid=" \
+            -o "../dist/v2node-linux-${{ matrix.arch }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2node-linux-${{ matrix.arch }}
+          path: dist/v2node-linux-${{ matrix.arch }}
+
+  release:
+    name: rolling-release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2node-nodepulse-latest
+          name: NodePulse v2node latest
+          body: "Rolling NodePulse v2node build following upstream wyx2685/v2node."
+          prerelease: true
+          make_latest: true
+          files: dist/v2node-*
