@@ -37,3 +37,20 @@ NodePulse remains responsible for `/api/v2/server/config.routes`; runtime connec
 Production deployment fetches that host-local runtime JSON from NodePulse:
 
 `/api/v2/server/local_config?node_type=v2node&node_id=<id>&token=<token>`
+
+## One-step Host Install
+
+NodePulse operation templates should stay small and call the installer in this
+repository instead of embedding the whole deployment script in database rows:
+
+```bash
+NODE_ID=20 \
+NODE_PORT=23333 \
+NODEPULSE_URL=https://node.eatp.top \
+NODEPULSE_TOKEN=... \
+bash <(curl -fsSL https://raw.githubusercontent.com/Bobbypower/nodepulse-v2node/main/ops/install-nodepulse-v2node.sh)
+```
+
+The installer downloads the latest patched binary, fetches the node-local JSON
+from NodePulse, writes a `v2node-<id>` systemd service, verifies it, and only
+then removes the old `v2node-<id>` Docker container.
