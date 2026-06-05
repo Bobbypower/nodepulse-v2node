@@ -48,7 +48,7 @@ NODE_ID=20 \
 NODE_PORT=23333 \
 NODEPULSE_URL=https://node.eatp.top \
 NODEPULSE_TOKEN=... \
-bash <(curl -fsSL https://raw.githubusercontent.com/Bobbypower/nodepulse-v2node/main/ops/install-nodepulse-v2node.sh)
+bash <(curl -fsSL https://github.com/Bobbypower/nodepulse-v2node/releases/download/v2node-nodepulse-latest/install-nodepulse-v2node.sh)
 ```
 
 The installer downloads the latest patched binary, fetches the node-local JSON

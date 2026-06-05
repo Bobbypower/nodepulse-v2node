@@ -9,6 +9,7 @@ on:
       - main
     paths:
       - ".github/workflows/build.yml"
+      - "ops/install-nodepulse-v2node.sh"
       - "ops/v2node/**"
 
 permissions:
@@ -82,11 +83,21 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout NodePulse patch repo
+        uses: actions/checkout@v4
+        with:
+          path: nodepulse-v2node
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Add installer asset
+        run: |
+          set -euo pipefail
+          cp nodepulse-v2node/ops/install-nodepulse-v2node.sh dist/install-nodepulse-v2node.sh
 
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
@@ -96,4 +107,6 @@ jobs:
           body: "Rolling NodePulse v2node build following upstream wyx2685/v2node."
           prerelease: true
           make_latest: true
-          files: dist/v2node-*
+          files: |
+            dist/v2node-*
+            dist/install-nodepulse-v2node.sh
