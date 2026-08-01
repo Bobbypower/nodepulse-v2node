@@ -37,12 +37,20 @@ if ! [[ "${VERIFY_SECONDS}" =~ ^[0-9]+$ ]] || [ "${VERIFY_SECONDS}" -lt 1 ]; the
   exit 2
 fi
 
-for command_name in systemctl python3 sha256sum ss; do
+for command_name in systemctl sha256sum ss; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Missing required command: ${command_name}" >&2
     exit 2
   fi
 done
+if command -v jq >/dev/null 2>&1; then
+  JSON_PARSER="jq"
+elif command -v python3 >/dev/null 2>&1; then
+  JSON_PARSER="python3"
+else
+  echo "Missing JSON parser: install jq or python3." >&2
+  exit 2
+fi
 
 DOCKER_CONTAINER="v2node-${NODE_ID}"
 SERVICE_NAME="v2node-${NODE_ID}"
@@ -214,8 +222,65 @@ echo "Fetching local and server runtime configuration from NodePulse."
 fetch_panel_json "/api/v2/server/local_config" "${TMP_LOCAL_CONFIG}"
 fetch_panel_json "/api/v2/server/config" "${TMP_SERVER_CONFIG}"
 
-python3 -m json.tool "${TMP_LOCAL_CONFIG}" >/dev/null
-python3 - "${TMP_SERVER_CONFIG}" "${NODE_PORT}" >"${TMP_EXPECTED_PORTS}" <<'PY'
+if [ "${JSON_PARSER}" = "jq" ]; then
+  jq -e . "${TMP_LOCAL_CONFIG}" >/dev/null
+  read -r -d '' JQ_SERVER_CONFIG_FILTER <<'JQ' || true
+def number_or_null:
+  if type == "number" then
+    .
+  elif type == "string" then
+    (try tonumber catch null)
+  else
+    null
+  end;
+
+. as $config
+| ($requested_port | tonumber) as $requested
+| if $config.status == "fail" then
+    error("NodePulse server config failed: \($config.message // "unknown error")")
+  else
+    .
+  end
+| ($config.server_port | number_or_null) as $primary
+| if ($primary == null or $primary < 1 or $primary > 65535) then
+    error("NodePulse server config has no valid server_port")
+  elif ($requested != 0 and $requested != $primary) then
+    error("NODE_PORT=\($requested) does not match NodePulse server_port=\($primary)")
+  else
+    .
+  end
+| if (($config.xhttp_download_inbound | type) == "object") then
+    if (($config.network // "" | tostring | ascii_downcase) != "xhttp") then
+      error("xhttp_download_inbound requires the primary network to be xhttp")
+    elif (($config.xhttp_download_inbound.network // "xhttp" | tostring | ascii_downcase) != "xhttp") then
+      error("xhttp_download_inbound.network must be xhttp")
+    elif (($config.xhttp_download_inbound.security // "none" | tostring | ascii_downcase) != "none") then
+      error("xhttp_download_inbound.security must be none")
+    else
+      .
+    end
+    | ($config.xhttp_download_inbound.server_port | number_or_null) as $download
+    | if ($download == null or $download < 1 or $download > 65535) then
+        error("xhttp_download_inbound has no valid server_port")
+      else
+        .
+      end
+    | ($config.network_settings.path // "/" | tostring) as $main_path
+    | ($config.xhttp_download_inbound.network_settings.path // $main_path | tostring) as $download_path
+    | if ($main_path != $download_path) then
+      error("XHTTP upload and download inbounds must use the same normalized path")
+      else
+        if ($primary == $download) then $primary else $primary, $download end
+      end
+  else
+    $primary
+  end
+JQ
+  jq -er --arg requested_port "${NODE_PORT}" "${JQ_SERVER_CONFIG_FILTER}" \
+    "${TMP_SERVER_CONFIG}" >"${TMP_EXPECTED_PORTS}"
+else
+  python3 -m json.tool "${TMP_LOCAL_CONFIG}" >/dev/null
+  python3 - "${TMP_SERVER_CONFIG}" "${NODE_PORT}" >"${TMP_EXPECTED_PORTS}" <<'PY'
 import json
 import sys
 
@@ -266,6 +331,7 @@ if isinstance(download, dict):
 for port in dict.fromkeys(ports):
     print(port)
 PY
+fi
 
 mapfile -t EXPECTED_PORTS <"${TMP_EXPECTED_PORTS}"
 if [ "${#EXPECTED_PORTS[@]}" -eq 0 ]; then
