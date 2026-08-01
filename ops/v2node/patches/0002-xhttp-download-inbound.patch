@@ -1,0 +1,428 @@
+diff --git a/api/v2board/node.go b/api/v2board/node.go
+index bb54731..2c57aa1 100644
+--- a/api/v2board/node.go
++++ b/api/v2board/node.go
+@@ -41,13 +41,14 @@ type CommonNode struct {
+ 	Tls                  int         `json:"tls"`
+ 	TlsSettings          TlsSettings `json:"tls_settings"`
+ 	CertInfo             *CertInfo
+-	Network              string          `json:"network"`
+-	NetworkSettings      json.RawMessage `json:"network_settings"`
+-	TrustedXForwardedFor []string        `json:"trusted_x_forwarded_for"`
+-	Encryption           string          `json:"encryption"`
+-	EncryptionSettings   EncSettings     `json:"encryption_settings"`
+-	ServerName           string          `json:"server_name"`
+-	Flow                 string          `json:"flow"`
++	Network              string                `json:"network"`
++	NetworkSettings      json.RawMessage       `json:"network_settings"`
++	XHTTPDownloadInbound *XHTTPDownloadInbound `json:"xhttp_download_inbound"`
++	TrustedXForwardedFor []string              `json:"trusted_x_forwarded_for"`
++	Encryption           string                `json:"encryption"`
++	EncryptionSettings   EncSettings           `json:"encryption_settings"`
++	ServerName           string                `json:"server_name"`
++	Flow                 string                `json:"flow"`
+ 	//shadowsocks
+ 	Cipher    string `json:"cipher"`
+ 	ServerKey string `json:"server_key"`
+@@ -64,6 +65,27 @@ type CommonNode struct {
+ 	Ignore_Client_Bandwidth bool   `json:"ignore_client_bandwidth"`
+ }
+ 
++type XHTTPDownloadInbound struct {
++	ListenIP        string          `json:"listen_ip"`
++	ServerPort      int             `json:"server_port"`
++	Network         string          `json:"network"`
++	Security        string          `json:"security"`
++	NetworkSettings json.RawMessage `json:"network_settings"`
++}
++
++func (c *CommonNode) XHTTPDownloadInboundPath() string {
++	if c == nil {
++		return "/"
++	}
++	var settings struct {
++		Path string `json:"path"`
++	}
++	if json.Unmarshal(c.NetworkSettings, &settings) == nil && settings.Path != "" {
++		return settings.Path
++	}
++	return "/"
++}
++
+ type Route struct {
+ 	Id          int      `json:"id"`
+ 	Match       []string `json:"match"`
+diff --git a/core/node.go b/core/node.go
+index 00afe19..fe156c3 100644
+--- a/core/node.go
++++ b/core/node.go
+@@ -1,11 +1,58 @@
+ package core
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 
+ 	panel "github.com/wyx2685/v2node/api/v2board"
+ )
+ 
++const xhttpDownloadTagSuffix = "-xhttp-download"
++
++func HasXHTTPDownloadInbound(info *panel.NodeInfo) bool {
++	return info != nil && info.Common != nil && info.Common.XHTTPDownloadInbound != nil &&
++		info.Common.XHTTPDownloadInbound.ServerPort > 0
++}
++
++func XHTTPDownloadTag(tag string) string {
++	return tag + xhttpDownloadTagSuffix
++}
++
++func xhttpDownloadNodeInfo(info *panel.NodeInfo) (*panel.NodeInfo, error) {
++	if !HasXHTTPDownloadInbound(info) {
++		return nil, nil
++	}
++	download := info.Common.XHTTPDownloadInbound
++	if download.Security != "" && download.Security != "none" {
++		return nil, fmt.Errorf("xhttp download inbound security must be none")
++	}
++	if download.Network != "" && download.Network != "xhttp" {
++		return nil, fmt.Errorf("xhttp download inbound network must be xhttp")
++	}
++	settings := download.NetworkSettings
++	if len(settings) == 0 {
++		settings, _ = json.Marshal(map[string]any{
++			"path": info.Common.XHTTPDownloadInboundPath(),
++			"mode": "auto",
++		})
++	}
++	clone := *info
++	common := *info.Common
++	common.ListenIP = download.ListenIP
++	if common.ListenIP == "" {
++		common.ListenIP = "0.0.0.0"
++	}
++	common.ServerPort = download.ServerPort
++	common.Network = "xhttp"
++	common.NetworkSettings = settings
++	common.Tls = panel.None
++	common.TlsSettings = panel.TlsSettings{}
++	common.XHTTPDownloadInbound = nil
++	clone.Security = panel.None
++	clone.Common = &common
++	return &clone, nil
++}
++
+ func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
+ 	inBoundConfig, err := buildInbound(info, tag)
+ 	if err != nil {
+@@ -15,10 +62,27 @@ func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
+ 	if err != nil {
+ 		return fmt.Errorf("add inbound error: %s", err)
+ 	}
++	downloadInfo, err := xhttpDownloadNodeInfo(info)
++	if err != nil {
++		_ = v.removeInbound(tag)
++		return fmt.Errorf("build xhttp download inbound info error: %s", err)
++	}
++	if downloadInfo != nil {
++		downloadInbound, err := buildInbound(downloadInfo, XHTTPDownloadTag(tag))
++		if err != nil {
++			_ = v.removeInbound(tag)
++			return fmt.Errorf("build xhttp download inbound error: %s", err)
++		}
++		if err := v.addInbound(downloadInbound); err != nil {
++			_ = v.removeInbound(tag)
++			return fmt.Errorf("add xhttp download inbound error: %s", err)
++		}
++	}
+ 	return nil
+ }
+ 
+ func (v *V2Core) DelNode(tag string) error {
++	_ = v.removeInbound(XHTTPDownloadTag(tag))
+ 	err := v.removeInbound(tag)
+ 	if err != nil {
+ 		return fmt.Errorf("remove in error: %s", err)
+diff --git a/core/user.go b/core/user.go
+index 05ea3a3..e2d003a 100644
+--- a/core/user.go
++++ b/core/user.go
+@@ -42,115 +42,142 @@ func (v *V2Core) GetUserManager(tag string) (proxy.UserManager, error) {
+ 	return userManager, nil
+ }
+ 
+-func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) error {
+-	userManager, err := vc.GetUserManager(tag)
+-	if err != nil {
+-		return fmt.Errorf("get user manager error: %s", err)
++func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {
++	tags := []string{tag}
++	if HasXHTTPDownloadInbound(info) {
++		tags = append(tags, XHTTPDownloadTag(tag))
+ 	}
+-	var user string
+ 	vc.users.mapLock.Lock()
+ 	defer vc.users.mapLock.Unlock()
+-	for i := range users {
+-		user = format.UserTag(tag, users[i].Uuid)
+-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+-		err = userManager.RemoveUser(ctx, user)
+-		cancel()
++	for _, targetTag := range tags {
++		userManager, err := vc.GetUserManager(targetTag)
+ 		if err != nil {
+-			return err
+-		}
+-		delete(vc.users.uidMap, user)
+-		if v, ok := vc.dispatcher.Counter.Load(tag); ok {
+-			tc := v.(*counter.TrafficCounter)
+-			tc.Delete(user)
++			return fmt.Errorf("get user manager error: %s", err)
+ 		}
+-		if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
+-			lm := v.(*dispatcher.LinkManager)
+-			lm.CloseAll()
+-			vc.dispatcher.LinkManagers.Delete(user)
++		for i := range users {
++			user := format.UserTag(targetTag, users[i].Uuid)
++			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++			err = userManager.RemoveUser(ctx, user)
++			cancel()
++			if err != nil {
++				return err
++			}
++			delete(vc.users.uidMap, user)
++			if value, ok := vc.dispatcher.Counter.Load(targetTag); ok {
++				tc := value.(*counter.TrafficCounter)
++				tc.Delete(user)
++			}
++			if value, ok := vc.dispatcher.LinkManagers.Load(user); ok {
++				lm := value.(*dispatcher.LinkManager)
++				lm.CloseAll()
++				vc.dispatcher.LinkManagers.Delete(user)
++			}
+ 		}
+ 	}
+ 	return nil
+ }
+ 
+ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
+-	trafficSlice := make([]panel.UserTraffic, 0)
+ 	vc.users.mapLock.RLock()
+ 	defer vc.users.mapLock.RUnlock()
+-	if v, ok := vc.dispatcher.Counter.Load(tag); ok {
+-		c := v.(*counter.TrafficCounter)
++	totals := make(map[int]*panel.UserTraffic)
++	storages := make(map[int][]*counter.TrafficStorage)
++	for _, targetTag := range []string{tag, XHTTPDownloadTag(tag)} {
++		value, ok := vc.dispatcher.Counter.Load(targetTag)
++		if !ok {
++			continue
++		}
++		c := value.(*counter.TrafficCounter)
+ 		c.Counters.Range(func(key, value interface{}) bool {
+ 			email := key.(string)
+ 			traffic := value.(*counter.TrafficStorage)
+-			up := traffic.UpCounter.Load()
+-			down := traffic.DownCounter.Load()
+-			if up+down > int64(mintraffic*1000) {
+-				traffic.UpCounter.Store(0)
+-				traffic.DownCounter.Store(0)
+-				if vc.users.uidMap[email] == 0 {
+-					c.Delete(email)
+-					return true
+-				}
+-				trafficSlice = append(trafficSlice, panel.UserTraffic{
+-					UID:      vc.users.uidMap[email],
+-					Upload:   up,
+-					Download: down,
+-				})
++			uid := vc.users.uidMap[email]
++			if uid == 0 {
++				c.Delete(email)
++				return true
+ 			}
++			total := totals[uid]
++			if total == nil {
++				total = &panel.UserTraffic{UID: uid}
++				totals[uid] = total
++			}
++			total.Upload += traffic.UpCounter.Load()
++			total.Download += traffic.DownCounter.Load()
++			storages[uid] = append(storages[uid], traffic)
+ 			return true
+ 		})
+-		if len(trafficSlice) == 0 {
+-			return nil, nil
++	}
++	trafficSlice := make([]panel.UserTraffic, 0, len(totals))
++	for uid, total := range totals {
++		if total.Upload+total.Download <= int64(mintraffic*1000) {
++			continue
+ 		}
+-		return trafficSlice, nil
++		for _, traffic := range storages[uid] {
++			traffic.UpCounter.Store(0)
++			traffic.DownCounter.Store(0)
++		}
++		trafficSlice = append(trafficSlice, *total)
++	}
++	if len(trafficSlice) == 0 {
++		return nil, nil
+ 	}
+-	return nil, nil
++	return trafficSlice, nil
+ }
+ 
+ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
+ 	v.users.mapLock.Lock()
+ 	defer v.users.mapLock.Unlock()
+-	for i := range p.Users {
+-		v.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
++	tags := []string{p.Tag}
++	if HasXHTTPDownloadInbound(p.NodeInfo) {
++		tags = append(tags, XHTTPDownloadTag(p.Tag))
+ 	}
+-	var users []*protocol.User
++	for _, targetTag := range tags {
++		for i := range p.Users {
++			v.users.uidMap[format.UserTag(targetTag, p.Users[i].Uuid)] = p.Users[i].Id
++		}
++		users, err := buildUsersForTag(targetTag, p)
++		if err != nil {
++			return 0, err
++		}
++		man, err := v.GetUserManager(targetTag)
++		if err != nil {
++			return 0, fmt.Errorf("get user manager error: %s", err)
++		}
++		for _, u := range users {
++			mUser, err := u.ToMemoryUser()
++			if err != nil {
++				return 0, err
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++			err = man.AddUser(ctx, mUser)
++			cancel()
++			if err != nil {
++				return 0, err
++			}
++		}
++	}
++	return len(p.Users), nil
++}
++
++func buildUsersForTag(tag string, p *AddUsersParams) ([]*protocol.User, error) {
+ 	switch p.NodeInfo.Type {
+ 	case "vmess":
+-		users = buildVmessUsers(p.Tag, p.Users)
++		return buildVmessUsers(tag, p.Users), nil
+ 	case "vless":
+-		users = buildVlessUsers(p.Tag, p.Users, p.Common.Flow)
++		return buildVlessUsers(tag, p.Users, p.Common.Flow), nil
+ 	case "trojan":
+-		users = buildTrojanUsers(p.Tag, p.Users)
++		return buildTrojanUsers(tag, p.Users), nil
+ 	case "shadowsocks":
+-		users = buildSSUsers(p.Tag,
+-			p.Users,
+-			p.Common.Cipher,
+-			p.Common.ServerKey)
++		return buildSSUsers(tag, p.Users, p.Common.Cipher, p.Common.ServerKey), nil
+ 	case "hysteria2":
+-		users = buildHysteria2Users(p.Tag, p.Users)
++		return buildHysteria2Users(tag, p.Users), nil
+ 	case "tuic":
+-		users = buildTuicUsers(p.Tag, p.Users)
++		return buildTuicUsers(tag, p.Users), nil
+ 	case "anytls":
+-		users = buildAnyTLSUsers(p.Tag, p.Users)
++		return buildAnyTLSUsers(tag, p.Users), nil
+ 	default:
+-		return 0, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
+-	}
+-	man, err := v.GetUserManager(p.Tag)
+-	if err != nil {
+-		return 0, fmt.Errorf("get user manager error: %s", err)
+-	}
+-	for _, u := range users {
+-		mUser, err := u.ToMemoryUser()
+-		if err != nil {
+-			return 0, err
+-		}
+-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+-		err = man.AddUser(ctx, mUser)
+-		cancel()
+-		if err != nil {
+-			return 0, err
+-		}
++		return nil, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
+ 	}
+-	return len(users), nil
+ }
+ 
+ func buildVmessUsers(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
+diff --git a/limiter/limiter.go b/limiter/limiter.go
+index f47c564..881a73f 100644
+--- a/limiter/limiter.go
++++ b/limiter/limiter.go
+@@ -68,6 +68,23 @@ func AddLimiter(nodetype string, tag string, users []panel.UserInfo, aliveList m
+ 	return l
+ }
+ 
++func AddLimiterAlias(tag string, l *Limiter, users []panel.UserInfo) {
++	if l == nil || tag == "" {
++		return
++	}
++	for i := range users {
++		userLimit := &UserLimitInfo{
++			UID:         users[i].Id,
++			SpeedLimit:  users[i].SpeedLimit,
++			DeviceLimit: users[i].DeviceLimit,
++		}
++		l.UserLimitInfo.Store(format.UserTag(tag, users[i].Uuid), userLimit)
++	}
++	limitLock.Lock()
++	limiter[tag] = l
++	limitLock.Unlock()
++}
++
+ func GetLimiter(tag string) (info *Limiter, err error) {
+ 	limitLock.RLock()
+ 	info, ok := limiter[tag]
+diff --git a/node/controller.go b/node/controller.go
+index 4e7a9fd..5947705 100644
+--- a/node/controller.go
++++ b/node/controller.go
+@@ -68,6 +68,9 @@ func (c *Controller) Start(x *core.V2Core) error {
+ 	// add limiter
+ 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
+ 	c.limiter = l
++	if core.HasXHTTPDownloadInbound(node) {
++		limiter.AddLimiterAlias(core.XHTTPDownloadTag(c.tag), l, c.userList)
++	}
+ 	if node.Security == panel.Tls {
+ 		err = c.requestCert()
+ 		if err != nil {
+@@ -95,6 +98,7 @@ func (c *Controller) Start(x *core.V2Core) error {
+ 
+ // Close implement the Close() function of the service interface
+ func (c *Controller) Close() error {
++	limiter.DeleteLimiter(core.XHTTPDownloadTag(c.tag))
+ 	limiter.DeleteLimiter(c.tag)
+ 	if c.nodeInfoMonitorPeriodic != nil {
+ 		c.nodeInfoMonitorPeriodic.Close()
+diff --git a/node/task.go b/node/task.go
+index bc144e0..5201cfb 100644
+--- a/node/task.go
++++ b/node/task.go
+@@ -140,6 +140,9 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
+ 	if len(added) > 0 || len(deleted) > 0 || len(modified) > 0 {
+ 		// update Limiter
+ 		c.limiter.UpdateUser(c.tag, added, deleted, modified)
++		if vCore.HasXHTTPDownloadInbound(c.info) {
++			c.limiter.UpdateUser(vCore.XHTTPDownloadTag(c.tag), added, deleted, modified)
++		}
+ 	}
+ 	c.userList = newU
+ 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))

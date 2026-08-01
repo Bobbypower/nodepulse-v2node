@@ -1,0 +1,94 @@
+diff --git a/core/node_test.go b/core/node_test.go
+new file mode 100644
+index 0000000..c6ca7a1
+--- /dev/null
++++ b/core/node_test.go
+@@ -0,0 +1,88 @@
++package core
++
++import (
++	"encoding/json"
++	"testing"
++
++	panel "github.com/wyx2685/v2node/api/v2board"
++)
++
++func TestXHTTPDownloadNodeInfo(t *testing.T) {
++	info := &panel.NodeInfo{
++		Security: panel.Reality,
++		Common: &panel.CommonNode{
++			ListenIP:        "0.0.0.0",
++			ServerPort:      443,
++			Network:         "xhttp",
++			NetworkSettings: json.RawMessage(`{"path":"/same-path","mode":"stream-up"}`),
++			Tls:             panel.Reality,
++			TlsSettings:     panel.TlsSettings{PrivateKey: "server-secret"},
++			XHTTPDownloadInbound: &panel.XHTTPDownloadInbound{
++				ServerPort: 80,
++				Network:    "xhttp",
++				Security:   "none",
++			},
++		},
++	}
++
++	download, err := xhttpDownloadNodeInfo(info)
++	if err != nil {
++		t.Fatalf("xhttpDownloadNodeInfo() error = %v", err)
++	}
++	if download == nil || download.Common == nil {
++		t.Fatal("xhttpDownloadNodeInfo() returned no download node")
++	}
++	if download.Security != panel.None || download.Common.Tls != panel.None {
++		t.Fatalf("download security = (%d, %d), want none", download.Security, download.Common.Tls)
++	}
++	if download.Common.ListenIP != "0.0.0.0" || download.Common.ServerPort != 80 {
++		t.Fatalf("download listener = %s:%d, want 0.0.0.0:80", download.Common.ListenIP, download.Common.ServerPort)
++	}
++	if download.Common.XHTTPDownloadInbound != nil {
++		t.Fatal("nested download inbound must be cleared")
++	}
++	if download.Common.TlsSettings.PrivateKey != "" {
++		t.Fatal("download inbound must not inherit REALITY private key")
++	}
++
++	var settings struct {
++		Path string `json:"path"`
++		Mode string `json:"mode"`
++	}
++	if err := json.Unmarshal(download.Common.NetworkSettings, &settings); err != nil {
++		t.Fatalf("decode download settings: %v", err)
++	}
++	if settings.Path != "/same-path" || settings.Mode != "auto" {
++		t.Fatalf("download settings = %#v, want same path and auto mode", settings)
++	}
++
++	if info.Common.ServerPort != 443 || info.Common.XHTTPDownloadInbound == nil {
++		t.Fatal("source node was mutated")
++	}
++}
++
++func TestXHTTPDownloadNodeInfoRejectsUnsupportedTransport(t *testing.T) {
++	tests := []struct {
++		name     string
++		network  string
++		security string
++	}{
++		{name: "tls", network: "xhttp", security: "tls"},
++		{name: "websocket", network: "ws", security: "none"},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			info := &panel.NodeInfo{Common: &panel.CommonNode{
++				XHTTPDownloadInbound: &panel.XHTTPDownloadInbound{
++					ServerPort: 80,
++					Network:    test.network,
++					Security:   test.security,
++				},
++			}}
++			if _, err := xhttpDownloadNodeInfo(info); err == nil {
++				t.Fatal("xhttpDownloadNodeInfo() accepted unsupported transport")
++			}
++		})
++	}
++}

@@ -1,0 +1,119 @@
+diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
+index 557f8a5..43d683c 100644
+--- a/transport/internet/splithttp/hub.go
++++ b/transport/internet/splithttp/hub.go
+@@ -37,8 +37,7 @@ type requestHandler struct {
+ 	host           string
+ 	path           string
+ 	ln             *Listener
+-	sessionMu      *sync.Mutex
+-	sessions       sync.Map
++	sessions       *sharedSessionRegistry
+ 	localAddr      net.Addr
+ 	socketSettings *internet.SocketConfig
+ }
+@@ -52,18 +51,32 @@ type httpSession struct {
+ 	isFullyConnected *done.Instance
+ }
+ 
++type sharedSessionRegistry struct {
++	mu       sync.Mutex
++	sessions sync.Map
++}
++
++// Split XHTTP can terminate uplink and downlink on different listeners. Keep
++// their session state shared inside one core process when the path matches.
++var sharedSessionRegistries sync.Map
++
++func sharedSessionRegistryForPath(path string) *sharedSessionRegistry {
++	registry, _ := sharedSessionRegistries.LoadOrStore(path, &sharedSessionRegistry{})
++	return registry.(*sharedSessionRegistry)
++}
++
+ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
+ 	// fast path
+-	currentSessionAny, ok := h.sessions.Load(sessionId)
++	currentSessionAny, ok := h.sessions.sessions.Load(sessionId)
+ 	if ok {
+ 		return currentSessionAny.(*httpSession)
+ 	}
+ 
+ 	// slow path
+-	h.sessionMu.Lock()
+-	defer h.sessionMu.Unlock()
++	h.sessions.mu.Lock()
++	defer h.sessions.mu.Unlock()
+ 
+-	currentSessionAny, ok = h.sessions.Load(sessionId)
++	currentSessionAny, ok = h.sessions.sessions.Load(sessionId)
+ 	if ok {
+ 		return currentSessionAny.(*httpSession)
+ 	}
+@@ -73,7 +84,7 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
+ 		isFullyConnected: done.New(),
+ 	}
+ 
+-	h.sessions.Store(sessionId, s)
++	h.sessions.sessions.Store(sessionId, s)
+ 
+ 	shouldReap := done.New()
+ 	go func() {
+@@ -83,7 +94,7 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
+ 	go func() {
+ 		select {
+ 		case <-shouldReap.Wait():
+-			h.sessions.Delete(sessionId)
++			h.sessions.sessions.Delete(sessionId)
+ 			s.uploadQueue.Close()
+ 		case <-s.isFullyConnected.Wait():
+ 		}
+@@ -350,7 +361,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
+ 			// after GET is done, the connection is finished. disable automatic
+ 			// session reaping, and handle it in defer
+ 			currentSession.isFullyConnected.Close()
+-			defer h.sessions.Delete(sessionId)
++			defer h.sessions.sessions.Delete(sessionId)
+ 		}
+ 
+ 		// magic header instructs nginx + apache to not buffer response body
+@@ -450,10 +461,9 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
+ 		host:           l.config.Host,
+ 		path:           l.config.GetNormalizedPath(),
+ 		ln:             l,
+-		sessionMu:      &sync.Mutex{},
+-		sessions:       sync.Map{},
+ 		socketSettings: streamSettings.SocketSettings,
+ 	}
++	handler.sessions = sharedSessionRegistryForPath(handler.path)
+ 	tlsConfig := getTLSConfig(streamSettings)
+ 	l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
+ 
+diff --git a/transport/internet/splithttp/shared_session_test.go b/transport/internet/splithttp/shared_session_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/internet/splithttp/shared_session_test.go
+@@ -0,0 +1,24 @@
++package splithttp
++
++import "testing"
++
++func TestSharedSessionRegistryForPath(t *testing.T) {
++	path := "/" + t.Name()
++	first := sharedSessionRegistryForPath(path)
++	second := sharedSessionRegistryForPath(path)
++	other := sharedSessionRegistryForPath(path + "-other")
++
++	if first != second {
++		t.Fatal("handlers with the same path must share a session registry")
++	}
++	if first == other {
++		t.Fatal("handlers with different paths must not share a session registry")
++	}
++
++	const sessionID = "test-session"
++	first.sessions.Store(sessionID, &httpSession{})
++	defer first.sessions.Delete(sessionID)
++	if _, ok := second.sessions.Load(sessionID); !ok {
++		t.Fatal("session inserted by one handler is not visible to the other")
++	}
++}

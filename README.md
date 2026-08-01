@@ -1,8 +1,12 @@
 ﻿# NodePulse v2node
 
-This repository follows upstream `wyx2685/v2node` and applies a small NodePulse patch set during GitHub Actions builds.
+This repository builds pinned revisions of `wyx2685/v2node` and its compatible
+Xray core, then applies the NodePulse patch set in GitHub Actions.
 
-It intentionally does not vendor upstream source. The workflow checks out upstream, applies `ops/v2node/patches/*.patch`, builds Linux binaries, and publishes a rolling prerelease.
+It intentionally does not vendor upstream source. The workflow checks out the
+documented revisions, applies `ops/v2node/patches/*.patch` and
+`ops/xray-core/patches/*.patch`, runs focused tests, builds Linux binaries, and
+publishes a rolling prerelease with SHA-256 checksums.
 
 ## Runtime Additions
 
@@ -34,6 +38,33 @@ It also adds file log rotation when `Log.Output` is set:
 
 NodePulse remains responsible for `/api/v2/server/config.routes`; runtime connection and process log policy are written into the host-local v2node config JSON during deployment.
 
+### Split XHTTP download inbound
+
+The NodePulse server payload may include an optional second XHTTP listener:
+
+```json
+"xhttp_download_inbound": {
+  "listen_ip": "0.0.0.0",
+  "server_port": 80,
+  "network": "xhttp",
+  "security": "none",
+  "network_settings": {
+    "path": "/same-path-as-upload",
+    "mode": "auto"
+  }
+}
+```
+
+v2node creates this listener in the same Xray process as the primary inbound,
+adds and removes the same users on both inbounds, and aggregates their traffic.
+The Xray patch shares XHTTP session state between listeners with the same
+normalized path. This permits a direct REALITY upload listener and a
+Cloudflare-origin HTTP download listener to participate in one XHTTP session.
+
+The download listener is intentionally restricted to `network: xhttp` and
+`security: none`. Client-side TLS, SNI, host, and CDN address remain subscription
+settings and are not copied into the origin listener.
+
 Production deployment fetches that host-local runtime JSON from NodePulse:
 
 `/api/v2/server/local_config?node_type=v2node&node_id=<id>&token=<token>`
@@ -51,6 +82,14 @@ NODEPULSE_TOKEN=... \
 bash <(curl -fsSL https://github.com/Bobbypower/nodepulse-v2node/releases/download/v2node-nodepulse-latest/install-nodepulse-v2node.sh)
 ```
 
-The installer downloads the latest patched binary, fetches the node-local JSON
-from NodePulse, writes a `v2node-<id>` systemd service, verifies it, and only
-then removes the old `v2node-<id>` Docker container.
+The installer downloads the latest patched binary, verifies it against the
+release `SHA256SUMS`, and fetches both the node-local and server runtime JSON
+from NodePulse. Before changing the host it stores the existing binary, config,
+and unit under `/root/nodepulse-backups`.
+
+It derives the complete listener set from the server payload. A split XHTTP
+node therefore succeeds only after both the primary port and the download port
+are listening and the service remains stable without automatic restarts. Any
+failure restores the previous systemd runtime and any previously running
+Docker or generic v2node service. Only a fully verified deployment removes the
+old container.

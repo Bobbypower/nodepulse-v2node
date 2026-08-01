@@ -1,5 +1,9 @@
 name: Build NodePulse v2node
 
+env:
+  V2NODE_REF: 2daa9dd4a114aa39294350475defa2b748d595ed
+  XRAY_CORE_REF: b17a88f9b46dabbdc2f3dff232dc91d6e13758fe
+
 on:
   workflow_dispatch:
   schedule:
@@ -11,6 +15,7 @@ on:
       - ".github/workflows/build.yml"
       - "ops/install-nodepulse-v2node.sh"
       - "ops/v2node/**"
+      - "ops/xray-core/**"
 
 permissions:
   contents: write
@@ -37,8 +42,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: wyx2685/v2node
+          ref: ${{ env.V2NODE_REF }}
           path: v2node
           submodules: recursive
+
+      - name: Checkout compatible Xray core
+        uses: actions/checkout@v4
+        with:
+          repository: wyx2685/xray-core
+          ref: ${{ env.XRAY_CORE_REF }}
+          path: xray-core
 
       - name: Apply NodePulse patches
         working-directory: v2node
@@ -49,11 +62,38 @@ jobs:
             git apply --whitespace=fix "${patch}"
           done
 
+      - name: Apply Xray core patches
+        working-directory: xray-core
+        run: |
+          set -euo pipefail
+          for patch in ../nodepulse-v2node/ops/xray-core/patches/*.patch; do
+            echo "Applying ${patch}"
+            git apply --whitespace=fix "${patch}"
+          done
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: v2node/go.mod
           cache-dependency-path: v2node/go.sum
+
+      - name: Test patched XHTTP session sharing
+        env:
+          GOEXPERIMENT: jsonv2
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          go test ./transport/internet/splithttp
+          cd ../v2node
+          go mod edit -replace github.com/xtls/xray-core=../xray-core
+          go test ./api/v2board ./core ./limiter ./node
+        working-directory: xray-core
+
+      - name: Validate installer
+        run: |
+          bash -n ops/install-nodepulse-v2node.sh
+          python3 ops/tests/test_installer_contract.py
+        working-directory: nodepulse-v2node
 
       - name: Build
         working-directory: v2node
@@ -64,6 +104,7 @@ jobs:
           GOEXPERIMENT: jsonv2
         run: |
           set -euo pipefail
+          go mod edit -replace github.com/xtls/xray-core=../xray-core
           upstream_sha="$(git rev-parse --short HEAD)"
           patch_sha="$(git -C ../nodepulse-v2node rev-parse --short HEAD)"
           version="nodepulse-${upstream_sha}-${patch_sha}"
@@ -81,6 +122,7 @@ jobs:
   release:
     name: rolling-release
     needs: build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout NodePulse patch repo
@@ -98,15 +140,31 @@ jobs:
         run: |
           set -euo pipefail
           cp nodepulse-v2node/ops/install-nodepulse-v2node.sh dist/install-nodepulse-v2node.sh
+          (
+            cd dist
+            sha256sum v2node-linux-* > SHA256SUMS
+          )
+
+      - name: Move rolling release tag
+        working-directory: nodepulse-v2node
+        run: |
+          set -euo pipefail
+          git tag --force v2node-nodepulse-latest "${GITHUB_SHA}"
+          git push origin refs/tags/v2node-nodepulse-latest --force
 
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2node-nodepulse-latest
           name: NodePulse v2node latest
-          body: "Rolling NodePulse v2node build following upstream wyx2685/v2node."
+          body: |
+            Reproducible NodePulse v2node build from pinned upstream revisions.
+
+            Includes XHTTP upload/download listener separation, same-path shared
+            sessions inside one Xray process, runtime policy, and log rotation.
           prerelease: true
           make_latest: true
           files: |
             dist/v2node-*
+            dist/SHA256SUMS
             dist/install-nodepulse-v2node.sh
