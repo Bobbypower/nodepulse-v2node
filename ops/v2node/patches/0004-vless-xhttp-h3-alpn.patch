@@ -1,0 +1,279 @@
+From b217c4fa199cd94234883e8077c05062f2bc7203 Mon Sep 17 00:00:00 2001
+From: Codex-Temp <codex-temp@invalid.local>
+Date: Fri, 4 Sep 2026 23:51:06 +0800
+Subject: [PATCH] feat: support VLESS XHTTP over H3
+
+---
+ api/v2board/node.go     |   1 +
+ core/inbound.go         |  45 +++++++++-
+ core/inbound_h3_test.go | 183 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 227 insertions(+), 2 deletions(-)
+ create mode 100644 core/inbound_h3_test.go
+
+diff --git a/api/v2board/node.go b/api/v2board/node.go
+index d31ba3d..354df8a 100644
+--- a/api/v2board/node.go
++++ b/api/v2board/node.go
+@@ -103,6 +103,7 @@ type BaseConfig struct {
+ type TlsSettings struct {
+ 	ServerName       string   `json:"server_name"`
+ 	ServerNames      []string `json:"server_names"`
++	ALPN             []string `json:"alpn"`
+ 	Dest             string   `json:"dest"`
+ 	ServerPort       string   `json:"server_port"`
+ 	ShortId          string   `json:"short_id"`
+diff --git a/core/inbound.go b/core/inbound.go
+index 979b095..b5969d0 100644
+--- a/core/inbound.go
++++ b/core/inbound.go
+@@ -47,8 +47,45 @@ func (v *V2Core) addInbound(config *core.InboundHandlerConfig) error {
+ 	return nil
+ }
+ 
++func validateH3Transport(nodeInfo *panel.NodeInfo) error {
++	if nodeInfo == nil || nodeInfo.Common == nil {
++		return nil
++	}
++	if nodeInfo.Type == "hysteria2" || nodeInfo.Type == "tuic" {
++		return nil
++	}
++
++	alpn := nodeInfo.Common.TlsSettings.ALPN
++	hasH3 := false
++	for _, protocol := range alpn {
++		if strings.EqualFold(strings.TrimSpace(protocol), "h3") {
++			hasH3 = true
++			break
++		}
++	}
++	if !hasH3 {
++		return nil
++	}
++	if len(alpn) != 1 || alpn[0] != "h3" {
++		return errors.New(`xhttp h3 requires tls_settings.alpn to be exactly ["h3"]`)
++	}
++	if nodeInfo.Security != panel.Tls {
++		return errors.New("xhttp h3 requires tls security; reality and security none are unsupported")
++	}
++	if nodeInfo.Common.Network != "xhttp" && nodeInfo.Common.Network != "splithttp" {
++		return fmt.Errorf("xhttp h3 requires xhttp network, got %q", nodeInfo.Common.Network)
++	}
++	if nodeInfo.Common.CertInfo == nil || nodeInfo.Common.CertInfo.CertMode == "" || nodeInfo.Common.CertInfo.CertMode == "none" {
++		return errors.New("xhttp h3 requires a configured tls certificate")
++	}
++	return nil
++}
++
+ // BuildInbound build Inbound config for different protocol
+ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
++	if err := validateH3Transport(nodeInfo); err != nil {
++		return nil, err
++	}
+ 	in := &coreConf.InboundDetourConfig{}
+ 	var err error
+ 	switch nodeInfo.Type {
+@@ -148,9 +185,13 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
+ 				},
+ 				RejectUnknownSNI: nodeInfo.Common.CertInfo.RejectUnknownSni,
+ 			}
++			if len(nodeInfo.Common.TlsSettings.ALPN) > 0 {
++				alpnList := coreConf.StringList(nodeInfo.Common.TlsSettings.ALPN)
++				in.StreamSetting.TLSSettings.ALPN = &alpnList
++			}
+ 			if nodeInfo.Type == "hysteria2" || nodeInfo.Type == "tuic" {
+-				alpnList := &coreConf.StringList{"h3"}
+-				in.StreamSetting.TLSSettings.ALPN = alpnList
++				alpnList := coreConf.StringList{"h3"}
++				in.StreamSetting.TLSSettings.ALPN = &alpnList
+ 			}
+ 		}
+ 	case panel.Reality:
+diff --git a/core/inbound_h3_test.go b/core/inbound_h3_test.go
+new file mode 100644
+index 0000000..63cfa0d
+--- /dev/null
++++ b/core/inbound_h3_test.go
+@@ -0,0 +1,183 @@
++package core
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	panel "github.com/wyx2685/v2node/api/v2board"
++	"github.com/xtls/xray-core/app/proxyman"
++	"github.com/xtls/xray-core/common/protocol/tls/cert"
++	xtls "github.com/xtls/xray-core/transport/internet/tls"
++)
++
++func testVLESSNode(network string, security int, alpn []string) *panel.NodeInfo {
++	return &panel.NodeInfo{
++		Type:     "vless",
++		Security: security,
++		Common: &panel.CommonNode{
++			ListenIP:        "127.0.0.1",
++			ServerPort:      23333,
++			Network:         network,
++			NetworkSettings: json.RawMessage(`{"path":"/h3-test","mode":"auto"}`),
++			Tls:             security,
++			TlsSettings: panel.TlsSettings{
++				ALPN: alpn,
++			},
++			CertInfo: &panel.CertInfo{
++				CertMode: "file",
++				CertFile: "test.crt",
++				KeyFile:  "test.key",
++			},
++		},
++	}
++}
++
++func setTestCertificate(t *testing.T, node *panel.NodeInfo) {
++	t.Helper()
++
++	generated, _ := cert.MustGenerate(nil, cert.DNSNames("example.com"))
++	certificatePEM, keyPEM := generated.ToPEM()
++	directory := t.TempDir()
++	certificateFile := filepath.Join(directory, "test.crt")
++	keyFile := filepath.Join(directory, "test.key")
++	if err := os.WriteFile(certificateFile, certificatePEM, 0o600); err != nil {
++		t.Fatalf("write test certificate: %v", err)
++	}
++	if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
++		t.Fatalf("write test private key: %v", err)
++	}
++	node.Common.CertInfo.CertFile = certificateFile
++	node.Common.CertInfo.KeyFile = keyFile
++}
++
++func TestBuildInboundVLESSXHTTPH3(t *testing.T) {
++	node := testVLESSNode("xhttp", panel.Tls, []string{"h3"})
++	setTestCertificate(t, node)
++	config, err := buildInbound(node, "h3-test")
++	if err != nil {
++		t.Fatalf("buildInbound() error = %v", err)
++	}
++
++	message, err := config.ReceiverSettings.GetInstance()
++	if err != nil {
++		t.Fatalf("decode receiver settings: %v", err)
++	}
++	receiver, ok := message.(*proxyman.ReceiverConfig)
++	if !ok {
++		t.Fatalf("receiver settings type = %T, want *proxyman.ReceiverConfig", message)
++	}
++	stream := receiver.GetStreamSettings()
++	if stream == nil {
++		t.Fatal("stream settings are nil")
++	}
++	if protocol := stream.GetEffectiveProtocol(); protocol != "xhttp" && protocol != "splithttp" {
++		t.Fatalf("transport protocol = %q, want xhttp", protocol)
++	}
++	security, err := stream.GetEffectiveSecuritySettings()
++	if err != nil {
++		t.Fatalf("decode security settings: %v", err)
++	}
++	tlsConfig, ok := security.(*xtls.Config)
++	if !ok {
++		t.Fatalf("security settings type = %T, want *tls.Config", security)
++	}
++	if len(tlsConfig.NextProtocol) != 1 || tlsConfig.NextProtocol[0] != "h3" {
++		t.Fatalf("TLS ALPN = %#v, want [h3]", tlsConfig.NextProtocol)
++	}
++}
++
++func TestBuildInboundRejectsInvalidH3Combinations(t *testing.T) {
++	tests := []struct {
++		name      string
++		mutate    func(*panel.NodeInfo)
++		wantError string
++	}{
++		{
++			name: "reality",
++			mutate: func(node *panel.NodeInfo) {
++				node.Security = panel.Reality
++				node.Common.Tls = panel.Reality
++			},
++			wantError: "requires tls security",
++		},
++		{
++			name: "security none",
++			mutate: func(node *panel.NodeInfo) {
++				node.Security = panel.None
++				node.Common.Tls = panel.None
++			},
++			wantError: "requires tls security",
++		},
++		{
++			name: "non xhttp transport",
++			mutate: func(node *panel.NodeInfo) {
++				node.Common.Network = "grpc"
++				node.Common.NetworkSettings = json.RawMessage(`{"serviceName":"h3-test"}`)
++			},
++			wantError: "requires xhttp network",
++		},
++		{
++			name: "mixed alpn",
++			mutate: func(node *panel.NodeInfo) {
++				node.Common.TlsSettings.ALPN = []string{"h2", "h3"}
++			},
++			wantError: `exactly ["h3"]`,
++		},
++		{
++			name: "missing certificate mode",
++			mutate: func(node *panel.NodeInfo) {
++				node.Common.CertInfo.CertMode = "none"
++			},
++			wantError: "requires a configured tls certificate",
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			node := testVLESSNode("xhttp", panel.Tls, []string{"h3"})
++			test.mutate(node)
++			if _, err := buildInbound(node, "h3-test"); err == nil || !strings.Contains(err.Error(), test.wantError) {
++				t.Fatalf("buildInbound() error = %v, want substring %q", err, test.wantError)
++			}
++		})
++	}
++}
++
++func TestValidateH3TransportKeepsNativeQUICProtocols(t *testing.T) {
++	for _, nodeType := range []string{"hysteria2", "tuic"} {
++		t.Run(nodeType, func(t *testing.T) {
++			node := testVLESSNode(nodeType, panel.Tls, []string{"h3"})
++			node.Type = nodeType
++			if err := validateH3Transport(node); err != nil {
++				t.Fatalf("validateH3Transport() error = %v", err)
++			}
++		})
++	}
++}
++
++func TestBuildInboundKeepsRealityForNonH3ALPN(t *testing.T) {
++	node := testVLESSNode("xhttp", panel.Reality, []string{"h2"})
++	node.Common.CertInfo = nil
++	node.Common.TlsSettings.ServerNames = []string{"example.com"}
++	node.Common.TlsSettings.Dest = "example.com"
++	node.Common.TlsSettings.ServerPort = "443"
++	node.Common.TlsSettings.ShortIds = []string{"0123456789abcdef"}
++	node.Common.TlsSettings.PrivateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++
++	config, err := buildInbound(node, "reality-test")
++	if err != nil {
++		t.Fatalf("buildInbound() error = %v", err)
++	}
++	message, err := config.ReceiverSettings.GetInstance()
++	if err != nil {
++		t.Fatalf("decode receiver settings: %v", err)
++	}
++	receiver := message.(*proxyman.ReceiverConfig)
++	stream := receiver.GetStreamSettings()
++	if stream == nil || !strings.Contains(strings.ToLower(stream.GetSecurityType()), "reality") {
++		t.Fatalf("security type = %q, want reality", stream.GetSecurityType())
++	}
++}

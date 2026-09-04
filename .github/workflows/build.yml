@@ -1,8 +1,8 @@
 name: Build NodePulse v2node
 
 env:
-  V2NODE_REF: 2daa9dd4a114aa39294350475defa2b748d595ed
-  XRAY_CORE_REF: b17a88f9b46dabbdc2f3dff232dc91d6e13758fe
+  V2NODE_REF: ad749f5220c800dc2dca65992d4b3f6864027855
+  XRAY_CORE_REF: 83ad74c463351e01c7cde391abfd9dded9e78300
 
 on:
   workflow_dispatch:
@@ -161,7 +161,8 @@ jobs:
             Reproducible NodePulse v2node build from pinned upstream revisions.
 
             Includes XHTTP upload/download listener separation, same-path shared
-            sessions inside one Xray process, runtime policy, and log rotation.
+            sessions inside one Xray process, VLESS XHTTP over TLS/H3, runtime
+            policy, and log rotation.
           prerelease: true
           make_latest: true
           files: |

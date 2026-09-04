@@ -65,6 +65,27 @@ The download listener is intentionally restricted to `network: xhttp` and
 `security: none`. Client-side TLS, SNI, host, and CDN address remain subscription
 settings and are not copied into the origin listener.
 
+### VLESS XHTTP over HTTP/3
+
+The v2node patch accepts `tls_settings.alpn` from the NodePulse server payload
+and applies it to the generated Xray TLS inbound. A direct VLESS XHTTP/H3 node
+uses this combination:
+
+```json
+{
+  "network": "xhttp",
+  "security": "tls",
+  "tls_settings": {
+    "alpn": ["h3"]
+  }
+}
+```
+
+H3 requires XHTTP (or its `splithttp` alias), TLS certificate mode, and ALPN
+exactly equal to `["h3"]`. The build rejects mixed ALPN, Reality, plaintext,
+and non-XHTTP combinations before starting the inbound. Native Hysteria2 and
+TUIC behavior remains unchanged.
+
 Production deployment fetches that host-local runtime JSON from NodePulse:
 
 `/api/v2/server/local_config?node_type=v2node&node_id=<id>&token=<token>`
