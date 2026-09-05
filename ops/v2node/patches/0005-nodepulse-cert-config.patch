@@ -1,0 +1,111 @@
+diff --git a/api/v2board/node.go b/api/v2board/node.go
+index 354df8a..6e29217 100644
+--- a/api/v2board/node.go
++++ b/api/v2board/node.go
+@@ -40,6 +40,7 @@ type CommonNode struct {
+ 	//vless vmess trojan
+ 	Tls                  int         `json:"tls"`
+ 	TlsSettings          TlsSettings `json:"tls_settings"`
++	CertConfig           TlsSettings `json:"cert_config"`
+ 	CertInfo             *CertInfo
+ 	Network              string                `json:"network"`
+ 	NetworkSettings      json.RawMessage       `json:"network_settings"`
+@@ -134,6 +135,36 @@ type CertInfo struct {
+ 	RejectUnknownSni bool
+ }
+ 
++func mergeCertConfig(tls *TlsSettings, cert TlsSettings) {
++	if tls == nil {
++		return
++	}
++	if cert.CertMode != "" {
++		tls.CertMode = cert.CertMode
++	}
++	if cert.CertFile != "" {
++		tls.CertFile = cert.CertFile
++	}
++	if cert.KeyFile != "" {
++		tls.KeyFile = cert.KeyFile
++	}
++	if cert.TlsCert != "" {
++		tls.TlsCert = cert.TlsCert
++	}
++	if cert.TlsKey != "" {
++		tls.TlsKey = cert.TlsKey
++	}
++	if cert.Provider != "" {
++		tls.Provider = cert.Provider
++	}
++	if cert.DNSEnv != "" {
++		tls.DNSEnv = cert.DNSEnv
++	}
++	if cert.RejectUnknownSni != "" {
++		tls.RejectUnknownSni = cert.RejectUnknownSni
++	}
++}
++
+ type EncSettings struct {
+ 	Mode          string `json:"mode"`
+ 	Ticket        string `json:"ticket"`
+@@ -185,6 +216,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("decode node params error: %s", err)
+ 	}
++	mergeCertConfig(&cm.TlsSettings, cm.CertConfig)
+ 	switch cm.Protocol {
+ 	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
+ 		node.Type = cm.Protocol
+diff --git a/api/v2board/node_cert_config_test.go b/api/v2board/node_cert_config_test.go
+new file mode 100644
+index 0000000..fe03319
+--- /dev/null
++++ b/api/v2board/node_cert_config_test.go
+@@ -0,0 +1,48 @@
++package panel
++
++import (
++	"encoding/json"
++	"reflect"
++	"testing"
++)
++
++func TestMergeTopLevelCertConfigIntoTLSSettings(t *testing.T) {
++	var node CommonNode
++	err := json.Unmarshal([]byte(`{
++		"tls_settings": {
++			"server_name": "jp4.eatp.top",
++			"server_names": ["jp4.eatp.top"],
++			"alpn": ["h3"]
++		},
++		"cert_config": {
++			"cert_mode": "http",
++			"cert_file": "/etc/v2node/vless66.cer",
++			"key_file": "/etc/v2node/vless66.key",
++			"reject_unknown_sni": "1"
++		}
++	}`), &node)
++	if err != nil {
++		t.Fatalf("decode node config: %v", err)
++	}
++
++	mergeCertConfig(&node.TlsSettings, node.CertConfig)
++
++	if node.TlsSettings.ServerName != "jp4.eatp.top" {
++		t.Fatalf("server name = %q", node.TlsSettings.ServerName)
++	}
++	if !reflect.DeepEqual(node.TlsSettings.ALPN, []string{"h3"}) {
++		t.Fatalf("ALPN = %#v", node.TlsSettings.ALPN)
++	}
++	if node.TlsSettings.CertMode != "http" {
++		t.Fatalf("cert mode = %q", node.TlsSettings.CertMode)
++	}
++	if node.TlsSettings.CertFile != "/etc/v2node/vless66.cer" {
++		t.Fatalf("cert file = %q", node.TlsSettings.CertFile)
++	}
++	if node.TlsSettings.KeyFile != "/etc/v2node/vless66.key" {
++		t.Fatalf("key file = %q", node.TlsSettings.KeyFile)
++	}
++	if node.TlsSettings.RejectUnknownSni != "1" {
++		t.Fatalf("reject unknown SNI = %q", node.TlsSettings.RejectUnknownSni)
++	}
++}

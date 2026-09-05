@@ -98,8 +98,13 @@ fetch_panel_json() {
 }
 
 port_is_listening() {
-  local port="$1"
-  ss -ltnH | awk '{print $4}' | grep -Eq "(:|\\])${port}$"
+  local transport="$1"
+  local port="$2"
+  case "${transport}" in
+    tcp) ss -ltnH ;;
+    udp) ss -lunH ;;
+    *) return 2 ;;
+  esac | awk '{print $4}' | grep -Eq "(:|\\])${port}$"
 }
 
 TMP_DIR="$(mktemp -d)"
@@ -107,7 +112,7 @@ TMP_BIN="${TMP_DIR}/v2node-linux-${V2NODE_ARCH}"
 TMP_LOCAL_CONFIG="${TMP_DIR}/local-config.json"
 TMP_SERVER_CONFIG="${TMP_DIR}/server-config.json"
 TMP_CHECKSUMS="${TMP_DIR}/SHA256SUMS"
-TMP_EXPECTED_PORTS="${TMP_DIR}/expected-ports"
+TMP_EXPECTED_ENDPOINTS="${TMP_DIR}/expected-endpoints"
 CHANGES_STARTED=0
 DEPLOY_COMMITTED=0
 BACKUP_DIR=""
@@ -249,6 +254,10 @@ def number_or_null:
   else
     .
   end
+| ($config.protocol // "" | tostring | ascii_downcase) as $protocol
+| ($config.network // "" | tostring | ascii_downcase) as $network
+| (($config.tls_settings.alpn // []) | if type == "array" then map(tostring | ascii_downcase) else [] end) as $alpn
+| (if ($protocol == "hysteria2" or $protocol == "tuic" or ((($network == "xhttp") or ($network == "splithttp")) and $alpn == ["h3"])) then "udp" else "tcp" end) as $primary_transport
 | if (($config.xhttp_download_inbound | type) == "object") then
     if (($config.network // "" | tostring | ascii_downcase) != "xhttp") then
       error("xhttp_download_inbound requires the primary network to be xhttp")
@@ -270,17 +279,21 @@ def number_or_null:
     | if ($main_path != $download_path) then
       error("XHTTP upload and download inbounds must use the same normalized path")
       else
-        if ($primary == $download) then $primary else $primary, $download end
+        if ($primary == $download and $primary_transport == "tcp") then
+          "tcp:\($primary)"
+        else
+          "\($primary_transport):\($primary)", "tcp:\($download)"
+        end
       end
   else
-    $primary
+    "\($primary_transport):\($primary)"
   end
 JQ
   jq -er --arg requested_port "${NODE_PORT}" "${JQ_SERVER_CONFIG_FILTER}" \
-    "${TMP_SERVER_CONFIG}" >"${TMP_EXPECTED_PORTS}"
+    "${TMP_SERVER_CONFIG}" >"${TMP_EXPECTED_ENDPOINTS}"
 else
   python3 -m json.tool "${TMP_LOCAL_CONFIG}" >/dev/null
-  python3 - "${TMP_SERVER_CONFIG}" "${NODE_PORT}" >"${TMP_EXPECTED_PORTS}" <<'PY'
+  python3 - "${TMP_SERVER_CONFIG}" "${NODE_PORT}" >"${TMP_EXPECTED_ENDPOINTS}" <<'PY'
 import json
 import sys
 
@@ -302,7 +315,18 @@ if requested_port and requested_port != primary_port:
         f"NODE_PORT={requested_port} does not match NodePulse server_port={primary_port}"
     )
 
-ports = [primary_port]
+protocol = str(config.get("protocol") or "").lower()
+network = str(config.get("network") or "").lower()
+tls_settings = config.get("tls_settings") or {}
+alpn = tls_settings.get("alpn") if isinstance(tls_settings, dict) else []
+alpn = [str(item).lower() for item in alpn] if isinstance(alpn, list) else []
+primary_transport = (
+    "udp"
+    if protocol in {"hysteria2", "tuic"}
+    or (network in {"xhttp", "splithttp"} and alpn == ["h3"])
+    else "tcp"
+)
+endpoints = [f"{primary_transport}:{primary_port}"]
 download = config.get("xhttp_download_inbound")
 if isinstance(download, dict):
     if str(config.get("network") or "").lower() != "xhttp":
@@ -326,19 +350,19 @@ if isinstance(download, dict):
         raise SystemExit(
             "XHTTP upload and download inbounds must use the same normalized path"
         )
-    ports.append(download_port)
+    endpoints.append(f"tcp:{download_port}")
 
-for port in dict.fromkeys(ports):
-    print(port)
+for endpoint in dict.fromkeys(endpoints):
+    print(endpoint)
 PY
 fi
 
-mapfile -t EXPECTED_PORTS <"${TMP_EXPECTED_PORTS}"
-if [ "${#EXPECTED_PORTS[@]}" -eq 0 ]; then
-  echo "No expected listener ports were resolved from NodePulse." >&2
+mapfile -t EXPECTED_ENDPOINTS <"${TMP_EXPECTED_ENDPOINTS}"
+if [ "${#EXPECTED_ENDPOINTS[@]}" -eq 0 ]; then
+  echo "No expected listener endpoints were resolved from NodePulse." >&2
   exit 1
 fi
-echo "Required listener ports: ${EXPECTED_PORTS[*]}"
+echo "Required listener endpoints: ${EXPECTED_ENDPOINTS[*]}"
 
 if [ -e "${BINARY_PATH}" ]; then HAD_BINARY=1; fi
 if [ -e "${CONFIG_PATH}" ]; then HAD_CONFIG=1; fi
@@ -411,8 +435,10 @@ restart_count="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value)"
 all_ports_ready=0
 for _ in $(seq 1 "${VERIFY_SECONDS}"); do
   all_ports_ready=1
-  for port in "${EXPECTED_PORTS[@]}"; do
-    if ! port_is_listening "${port}"; then
+  for endpoint in "${EXPECTED_ENDPOINTS[@]}"; do
+    transport="${endpoint%%:*}"
+    port="${endpoint#*:}"
+    if ! port_is_listening "${transport}" "${port}"; then
       all_ports_ready=0
       break
     fi
@@ -431,15 +457,17 @@ if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
   exit 1
 fi
 if [ "${all_ports_ready}" != "1" ]; then
-  echo "${SERVICE_NAME} did not open every required listener: ${EXPECTED_PORTS[*]}" >&2
-  ss -lntpH || true
+  echo "${SERVICE_NAME} did not open every required listener: ${EXPECTED_ENDPOINTS[*]}" >&2
+  ss -lntupH || true
   journalctl -u "${SERVICE_NAME}.service" -n 120 --no-pager || true
   exit 1
 fi
-for port in "${EXPECTED_PORTS[@]}"; do
-  if ! port_is_listening "${port}"; then
-    echo "${SERVICE_NAME} lost required listener ${port} during verification." >&2
-    ss -lntpH || true
+for endpoint in "${EXPECTED_ENDPOINTS[@]}"; do
+  transport="${endpoint%%:*}"
+  port="${endpoint#*:}"
+  if ! port_is_listening "${transport}" "${port}"; then
+    echo "${SERVICE_NAME} lost required listener ${endpoint} during verification." >&2
+    ss -lntupH || true
     journalctl -u "${SERVICE_NAME}.service" -n 120 --no-pager || true
     exit 1
   fi
@@ -462,5 +490,5 @@ DEPLOY_COMMITTED=1
 journalctl --rotate || true
 journalctl --vacuum-size="${JOURNAL_VACUUM_SIZE}" || true
 systemctl status "${SERVICE_NAME}.service" --no-pager -l | sed -n '1,80p'
-echo "Verified listeners: ${EXPECTED_PORTS[*]}"
+echo "Verified listeners: ${EXPECTED_ENDPOINTS[*]}"
 echo "Installed version: $("${BINARY_PATH}" version 2>&1 | head -n 1)"

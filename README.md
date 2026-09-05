@@ -86,6 +86,12 @@ exactly equal to `["h3"]`. The build rejects mixed ALPN, Reality, plaintext,
 and non-XHTTP combinations before starting the inbound. Native Hysteria2 and
 TUIC behavior remains unchanged.
 
+NodePulse may send certificate automation in the top-level `cert_config`
+object. The patched v2node merges those fields into its TLS certificate
+settings, so `{"cert_mode":"http"}` uses v2node's built-in ACME HTTP-01
+client and daily renewal task. The installer recognizes direct XHTTP/H3 as a
+UDP listener and verifies the actual UDP socket before committing deployment.
+
 Production deployment fetches that host-local runtime JSON from NodePulse:
 
 `/api/v2/server/local_config?node_type=v2node&node_id=<id>&token=<token>`

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "ops" / "install-nodepulse-v2node.sh"
 START_MARKER = (
     'python3 - "${TMP_SERVER_CONFIG}" "${NODE_PORT}" '
-    '>"${TMP_EXPECTED_PORTS}" <<\'PY\'\n'
+    '>"${TMP_EXPECTED_ENDPOINTS}" <<\'PY\'\n'
 )
 END_MARKER = "\nPY\n"
 JQ_START_MARKER = "  read -r -d '' JQ_SERVER_CONFIG_FILTER <<'JQ' || true\n"
@@ -102,11 +102,34 @@ def main() -> None:
     for validator in validators:
         valid = validator(split_config(), 443)
         assert valid.returncode == 0, valid.stderr
-        assert valid.stdout.splitlines() == ["443", "80"]
+        assert valid.stdout.splitlines() == ["tcp:443", "tcp:80"]
 
         backend_ports = validator(split_config(8443, 8080), 8443)
         assert backend_ports.returncode == 0, backend_ports.stderr
-        assert backend_ports.stdout.splitlines() == ["8443", "8080"]
+        assert backend_ports.stdout.splitlines() == ["tcp:8443", "tcp:8080"]
+
+        h3 = split_config(23333, 80)
+        h3.pop("xhttp_download_inbound")
+        h3["protocol"] = "vless"
+        h3["tls_settings"] = {"alpn": ["h3"]}
+        valid_h3 = validator(h3, 23333)
+        assert valid_h3.returncode == 0, valid_h3.stderr
+        assert valid_h3.stdout.splitlines() == ["udp:23333"]
+
+        mixed_alpn = dict(h3)
+        mixed_alpn["tls_settings"] = {"alpn": ["h2", "h3"]}
+        valid_mixed_alpn = validator(mixed_alpn, 23333)
+        assert valid_mixed_alpn.returncode == 0, valid_mixed_alpn.stderr
+        assert valid_mixed_alpn.stdout.splitlines() == ["tcp:23333"]
+
+        hysteria = {
+            "protocol": "hysteria2",
+            "server_port": 24444,
+            "network": "udp",
+        }
+        valid_hysteria = validator(hysteria, 24444)
+        assert valid_hysteria.returncode == 0, valid_hysteria.stderr
+        assert valid_hysteria.stdout.splitlines() == ["udp:24444"]
 
         mismatched_path = split_config()
         download = dict(mismatched_path["xhttp_download_inbound"])
