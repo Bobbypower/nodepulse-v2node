@@ -37,12 +37,20 @@ if ! [[ "${VERIFY_SECONDS}" =~ ^[0-9]+$ ]] || [ "${VERIFY_SECONDS}" -lt 1 ]; the
   exit 2
 fi
 
-for command_name in systemctl sha256sum ss; do
+for command_name in systemctl sha256sum ss flock; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Missing required command: ${command_name}" >&2
     exit 2
   fi
 done
+
+install -d -m 0755 /run/lock
+LOCK_PATH="/run/lock/nodepulse-v2node-deploy.lock"
+exec 9>"${LOCK_PATH}"
+if ! flock -n 9; then
+  echo "Another NodePulse v2node deployment is already running on this host." >&2
+  exit 75
+fi
 if command -v jq >/dev/null 2>&1; then
   JSON_PARSER="jq"
 elif command -v python3 >/dev/null 2>&1; then
@@ -70,14 +78,19 @@ esac
 download_file() {
   local url="$1"
   local output="$2"
+  local partial="${output}.part"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "${output}" "${url}"
+    curl --fail --location --show-error --silent \
+      --retry 8 --retry-delay 2 --retry-max-time 900 --retry-all-errors \
+      --connect-timeout 20 --speed-time 45 --speed-limit 1024 \
+      --continue-at - --output "${partial}" "${url}"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --https-only -O "${output}" "${url}"
+    wget -q --https-only --continue --tries=8 --timeout=30 -O "${partial}" "${url}"
   else
     echo "Neither curl nor wget is installed." >&2
     return 1
   fi
+  mv -f -- "${partial}" "${output}"
 }
 
 fetch_panel_json() {
@@ -130,10 +143,23 @@ restore_path() {
   local backup_name="$2"
   local target="$3"
   if [ "${existed}" = "1" ]; then
+    rm -f -- "${target}"
     cp -a "${BACKUP_DIR}/${backup_name}" "${target}"
   else
     rm -f -- "${target}"
   fi
+}
+
+atomic_install() {
+  local source="$1"
+  local target="$2"
+  local mode="$3"
+  local target_dir stage
+  target_dir="$(dirname "${target}")"
+  install -d "${target_dir}"
+  stage="$(mktemp "${target_dir}/.$(basename "${target}").new.XXXXXX")"
+  install -m "${mode}" "${source}" "${stage}"
+  mv -fT -- "${stage}" "${target}"
 }
 
 rollback_runtime() {
@@ -364,9 +390,9 @@ if [ "${#EXPECTED_ENDPOINTS[@]}" -eq 0 ]; then
 fi
 echo "Required listener endpoints: ${EXPECTED_ENDPOINTS[*]}"
 
-if [ -e "${BINARY_PATH}" ]; then HAD_BINARY=1; fi
-if [ -e "${CONFIG_PATH}" ]; then HAD_CONFIG=1; fi
-if [ -e "${SERVICE_UNIT}" ]; then HAD_UNIT=1; fi
+if [ -e "${BINARY_PATH}" ] || [ -L "${BINARY_PATH}" ]; then HAD_BINARY=1; fi
+if [ -e "${CONFIG_PATH}" ] || [ -L "${CONFIG_PATH}" ]; then HAD_CONFIG=1; fi
+if [ -e "${SERVICE_UNIT}" ] || [ -L "${SERVICE_UNIT}" ]; then HAD_UNIT=1; fi
 if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then OLD_SERVICE_ACTIVE=1; fi
 if systemctl is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null; then OLD_SERVICE_ENABLED=1; fi
 if command -v docker >/dev/null 2>&1 && docker inspect "${DOCKER_CONTAINER}" >/dev/null 2>&1; then
@@ -379,8 +405,9 @@ if systemctl is-active --quiet v2node.service 2>/dev/null; then
 fi
 
 backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-BACKUP_DIR="/root/nodepulse-backups/${SERVICE_NAME}-${backup_stamp}"
-install -d -m 0700 "${BACKUP_DIR}"
+install -d -m 0700 /root/nodepulse-backups
+BACKUP_DIR="$(mktemp -d "/root/nodepulse-backups/${SERVICE_NAME}-${backup_stamp}.XXXXXX")"
+chmod 0700 "${BACKUP_DIR}"
 if [ "${HAD_BINARY}" = "1" ]; then cp -a "${BINARY_PATH}" "${BACKUP_DIR}/v2node"; fi
 if [ "${HAD_CONFIG}" = "1" ]; then cp -a "${CONFIG_PATH}" "${BACKUP_DIR}/v2node-${NODE_ID}.json"; fi
 if [ "${HAD_UNIT}" = "1" ]; then cp -a "${SERVICE_UNIT}" "${BACKUP_DIR}/${SERVICE_NAME}.service"; fi
@@ -397,10 +424,11 @@ echo "Previous runtime backup: ${BACKUP_DIR}"
 
 mkdir -p /etc/v2node /var/log/v2node
 CHANGES_STARTED=1
-install -m 0755 "${TMP_BIN}" "${BINARY_PATH}"
-install -m 0600 "${TMP_LOCAL_CONFIG}" "${CONFIG_PATH}"
+atomic_install "${TMP_BIN}" "${BINARY_PATH}" 0755
+atomic_install "${TMP_LOCAL_CONFIG}" "${CONFIG_PATH}" 0600
 
-cat >"${SERVICE_UNIT}" <<EOF
+TMP_SERVICE_UNIT="$(mktemp "$(dirname "${SERVICE_UNIT}")/.${SERVICE_NAME}.service.new.XXXXXX")"
+cat >"${TMP_SERVICE_UNIT}" <<EOF
 [Unit]
 Description=NodePulse v2node ${NODE_ID}
 After=network-online.target
@@ -416,6 +444,8 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+chmod 0644 "${TMP_SERVICE_UNIT}"
+mv -fT -- "${TMP_SERVICE_UNIT}" "${SERVICE_UNIT}"
 systemctl daemon-reload
 
 if [ "${OLD_DOCKER_RUNNING}" = "1" ]; then

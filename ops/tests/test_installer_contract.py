@@ -160,5 +160,31 @@ def main() -> None:
     print("installer contract tests passed")
 
 
+def test_installer_serializes_shared_binary_updates() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+
+    assert 'LOCK_PATH="/run/lock/nodepulse-v2node-deploy.lock"' in source
+    assert "flock -n 9" in source
+    assert "exit 75" in source
+
+
+def test_installer_downloads_with_resume_and_retries() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+
+    assert '--retry-all-errors' in source
+    assert '--continue-at -' in source
+    assert 'local partial="${output}.part"' in source
+    assert 'mv -f -- "${partial}" "${output}"' in source
+
+
+def test_installer_uses_unique_backups_and_atomic_replacement() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+
+    assert 'mktemp -d "/root/nodepulse-backups/${SERVICE_NAME}-${backup_stamp}.XXXXXX"' in source
+    assert 'stage="$(mktemp "${target_dir}/.$(basename "${target}").new.XXXXXX")"' in source
+    assert 'mv -fT -- "${stage}" "${target}"' in source
+    assert '[ -e "${BINARY_PATH}" ] || [ -L "${BINARY_PATH}" ]' in source
+
+
 if __name__ == "__main__":
     main()
