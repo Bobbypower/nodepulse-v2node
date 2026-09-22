@@ -1,0 +1,444 @@
+diff --git a/api/v2board/audit_test.go b/api/v2board/audit_test.go
+new file mode 100644
+index 0000000..5f204cb
+--- /dev/null
++++ b/api/v2board/audit_test.go
+@@ -0,0 +1,52 @@
++package panel
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/go-resty/resty/v2"
++)
++
++func TestReportAuditEventsSendsCapabilityHeartbeat(t *testing.T) {
++	var received AuditBatch
++	var rawBody []byte
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/api/v1/server/UniProxy/audit" {
++			t.Fatalf("path = %s", r.URL.Path)
++		}
++		if r.URL.Query().Get("node_id") != "7" || r.URL.Query().Get("token") != "token" {
++			t.Fatalf("query = %s", r.URL.RawQuery)
++		}
++		var err error
++		rawBody, err = io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatalf("read request: %v", err)
++		}
++		if err := json.Unmarshal(rawBody, &received); err != nil {
++			t.Fatalf("decode request: %v", err)
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"status":"ok"}`))
++	}))
++	defer server.Close()
++
++	client := &Client{client: resty.New().SetBaseURL(server.URL).SetQueryParams(map[string]string{
++		"node_type": "v2node",
++		"node_id":   "7",
++		"token":     "token",
++	})}
++	if err := client.ReportAuditEvents(context.Background(), nil); err != nil {
++		t.Fatalf("ReportAuditEvents() error = %v", err)
++	}
++	if received.CapabilityVersion != "1" || len(received.Events) != 0 {
++		t.Fatalf("received batch = %#v", received)
++	}
++	if !bytes.Contains(rawBody, []byte(`"events":[]`)) {
++		t.Fatalf("heartbeat must encode an empty events array: %s", rawBody)
++	}
++}
+diff --git a/api/v2board/user.go b/api/v2board/user.go
+index b6d5ad3..5d8466c 100644
+--- a/api/v2board/user.go
++++ b/api/v2board/user.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"strings"
++	"time"
+ 
+ 	"encoding/json/jsontext"
+ 	"encoding/json/v2"
+@@ -126,6 +127,42 @@ type UserTraffic struct {
+ 	Download int64
+ }
+ 
++type AuditEvent struct {
++	EventID       string    `json:"event_id"`
++	NodeID        int       `json:"node_id"`
++	UserID        int       `json:"user_id"`
++	RuleID        int       `json:"rule_id"`
++	ViolationType string    `json:"violation_type"`
++	OccurredAt    time.Time `json:"occurred_at"`
++}
++
++type AuditBatch struct {
++	CapabilityVersion string       `json:"capability_version"`
++	Events            []AuditEvent `json:"events"`
++}
++
++func (c *Client) ReportAuditEvents(ctx context.Context, events []AuditEvent) error {
++	const path = "/api/v1/server/UniProxy/audit"
++	if events == nil {
++		events = make([]AuditEvent, 0)
++	}
++	r, err := c.client.R().
++		SetContext(ctx).
++		SetBody(AuditBatch{CapabilityVersion: "1", Events: events}).
++		ForceContentType("application/json").
++		Post(path)
++	if err != nil {
++		return err
++	}
++	if r == nil {
++		return errors.New("audit report received nil response")
++	}
++	if r.StatusCode() >= 300 {
++		return fmt.Errorf("audit report failed with status %d", r.StatusCode())
++	}
++	return nil
++}
++
+ // ReportUserTraffic reports the user traffic
+ func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffic) error {
+ 	data := make(map[int][]int64, len(userTraffic))
+diff --git a/core/app/dispatcher/default.go b/core/app/dispatcher/default.go
+index 2e5bebf..cf2d806 100644
+--- a/core/app/dispatcher/default.go
++++ b/core/app/dispatcher/default.go
+@@ -107,6 +107,36 @@ type DefaultDispatcher struct {
+ 	fdns         dns.FakeDNSEngine
+ 	Counter      sync.Map
+ 	LinkManagers sync.Map // map[string]*LinkManager
++	auditMu      sync.RWMutex
++	auditSink    func(AuditHit)
++}
++
++type AuditHit struct {
++	RuleTag    string
++	User       string
++	OccurredAt time.Time
++}
++
++func (d *DefaultDispatcher) SetAuditSink(sink func(AuditHit)) {
++	d.auditMu.Lock()
++	d.auditSink = sink
++	d.auditMu.Unlock()
++}
++
++func (d *DefaultDispatcher) recordAuditHit(ctx context.Context, ruleTag string) {
++	if !strings.HasPrefix(ruleTag, "audit:") {
++		return
++	}
++	inbound := session.InboundFromContext(ctx)
++	if inbound == nil || inbound.User == nil || inbound.User.Email == "" {
++		return
++	}
++	d.auditMu.RLock()
++	sink := d.auditSink
++	d.auditMu.RUnlock()
++	if sink != nil {
++		sink(AuditHit{RuleTag: ruleTag, User: inbound.User.Email, OccurredAt: time.Now().UTC()})
++	}
+ }
+ 
+ func init() {
+@@ -536,6 +566,9 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
+ 					errors.LogInfo(ctx, "Hit route rule: [", route.GetRuleTag(), "] so taking detour [", outTag, "] for [", destination, "]")
+ 				}
+ 				handler = h
++				if outTag == "block" {
++					d.recordAuditHit(ctx, route.GetRuleTag())
++				}
+ 			} else {
+ 				errors.LogWarning(ctx, "non existing outTag: ", outTag)
+ 				common.Close(link.Writer)
+diff --git a/core/audit.go b/core/audit.go
+new file mode 100644
+index 0000000..fc65685
+--- /dev/null
++++ b/core/audit.go
+@@ -0,0 +1,88 @@
++package core
++
++import (
++	"crypto/sha256"
++	"fmt"
++	"strconv"
++	"strings"
++	"time"
++
++	panel "github.com/wyx2685/v2node/api/v2board"
++	"github.com/wyx2685/v2node/core/app/dispatcher"
++)
++
++const maxPendingAuditEvents = 1024
++
++func (v *V2Core) captureAuditHit(hit dispatcher.AuditHit) {
++	parts := strings.SplitN(hit.RuleTag, ":", 4)
++	if len(parts) != 4 || parts[0] != "audit" {
++		return
++	}
++	nodeID, nodeErr := strconv.Atoi(parts[1])
++	ruleID, ruleErr := strconv.Atoi(parts[2])
++	if nodeErr != nil || ruleErr != nil || nodeID <= 0 || ruleID <= 0 {
++		return
++	}
++	violationType := parts[3]
++	switch violationType {
++	case "block", "block_ip", "block_port", "protocol":
++	default:
++		return
++	}
++
++	v.users.mapLock.RLock()
++	userID := v.users.uidMap[hit.User]
++	v.users.mapLock.RUnlock()
++	if userID <= 0 {
++		return
++	}
++	occurredAt := hit.OccurredAt.UTC()
++	minute := occurredAt.Truncate(time.Minute).Unix()
++	digest := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%d:%s:%d", nodeID, userID, ruleID, violationType, minute)))
++	eventID := fmt.Sprintf("%x", digest[:])
++
++	v.auditMu.Lock()
++	defer v.auditMu.Unlock()
++	if _, exists := v.auditQueue[eventID]; exists || len(v.auditQueue) >= maxPendingAuditEvents {
++		return
++	}
++	v.auditQueue[eventID] = panel.AuditEvent{
++		EventID:       eventID,
++		NodeID:        nodeID,
++		UserID:        userID,
++		RuleID:        ruleID,
++		ViolationType: violationType,
++		OccurredAt:    occurredAt,
++	}
++}
++
++func (v *V2Core) DrainAuditEvents(nodeID int, limit int) []panel.AuditEvent {
++	if limit <= 0 {
++		limit = 256
++	}
++	v.auditMu.Lock()
++	defer v.auditMu.Unlock()
++	events := make([]panel.AuditEvent, 0, limit)
++	for eventID, event := range v.auditQueue {
++		if event.NodeID != nodeID {
++			continue
++		}
++		events = append(events, event)
++		delete(v.auditQueue, eventID)
++		if len(events) >= limit {
++			break
++		}
++	}
++	return events
++}
++
++func (v *V2Core) RequeueAuditEvents(events []panel.AuditEvent) {
++	v.auditMu.Lock()
++	defer v.auditMu.Unlock()
++	for _, event := range events {
++		if len(v.auditQueue) >= maxPendingAuditEvents {
++			return
++		}
++		v.auditQueue[event.EventID] = event
++	}
++}
+diff --git a/core/audit_test.go b/core/audit_test.go
+new file mode 100644
+index 0000000..b763155
+--- /dev/null
++++ b/core/audit_test.go
+@@ -0,0 +1,64 @@
++package core
++
++import (
++	"testing"
++	"time"
++
++	panel "github.com/wyx2685/v2node/api/v2board"
++	"github.com/wyx2685/v2node/conf"
++	"github.com/wyx2685/v2node/core/app/dispatcher"
++)
++
++func TestAuditCollectorDeduplicatesAndRequeues(t *testing.T) {
++	v := New(&conf.Conf{})
++	v.users.uidMap["node-user"] = 42
++	now := time.Date(2026, 9, 22, 5, 0, 15, 0, time.UTC)
++	hit := dispatcher.AuditHit{
++		RuleTag:    "audit:7:3:block",
++		User:       "node-user",
++		OccurredAt: now,
++	}
++	v.captureAuditHit(hit)
++	hit.OccurredAt = now.Add(20 * time.Second)
++	v.captureAuditHit(hit)
++
++	events := v.DrainAuditEvents(7, 256)
++	if len(events) != 1 {
++		t.Fatalf("DrainAuditEvents() returned %d events, want 1", len(events))
++	}
++	event := events[0]
++	if event.NodeID != 7 || event.UserID != 42 || event.RuleID != 3 || event.ViolationType != "block" {
++		t.Fatalf("unexpected event: %#v", event)
++	}
++	if event.EventID == "" {
++		t.Fatal("event ID is empty")
++	}
++
++	v.RequeueAuditEvents(events)
++	if got := v.DrainAuditEvents(7, 256); len(got) != 1 || got[0].EventID != event.EventID {
++		t.Fatalf("requeued events = %#v, want original event", got)
++	}
++}
++
++func TestCustomBlockRoutesCarryAuditRuleTags(t *testing.T) {
++	actionValue := "tcp"
++	info := &panel.NodeInfo{
++		Id:  7,
++		Tag: "node-7",
++		Common: &panel.CommonNode{Routes: []panel.Route{
++			{Id: 3, Match: []string{"domain:canary.invalid"}, Action: "block"},
++			{Id: 4, Match: []string{"25"}, Action: "block_port", ActionValue: &actionValue},
++		}},
++	}
++	_, _, routes, err := GetCustomConfig([]*panel.NodeInfo{info})
++	if err != nil {
++		t.Fatalf("GetCustomConfig() error = %v", err)
++	}
++	tags := map[string]bool{}
++	for _, rule := range routes.GetRule() {
++		tags[rule.GetRuleTag()] = true
++	}
++	if !tags["audit:7:3:block"] || !tags["audit:7:4:block_port"] {
++		t.Fatalf("audit rule tags missing: %#v", tags)
++	}
++}
+diff --git a/core/core.go b/core/core.go
+index 2cbaeb9..5e389d0 100644
+--- a/core/core.go
++++ b/core/core.go
+@@ -34,6 +34,8 @@ type V2Core struct {
+ 	ihm        inbound.Manager
+ 	ohm        outbound.Manager
+ 	dispatcher *dispatcher.DefaultDispatcher
++	auditMu    sync.Mutex
++	auditQueue map[string]panel.AuditEvent
+ }
+ 
+ type UserMap struct {
+@@ -43,7 +45,8 @@ type UserMap struct {
+ 
+ func New(config *conf.Conf) *V2Core {
+ 	core := &V2Core{
+-		Config: config,
++		Config:     config,
++		auditQueue: make(map[string]panel.AuditEvent),
+ 		users: &UserMap{
+ 			uidMap: make(map[string]int),
+ 		},
+@@ -61,6 +64,7 @@ func (v *V2Core) Start(infos []*panel.NodeInfo) error {
+ 	v.ihm = v.Server.GetFeature(inbound.ManagerType()).(inbound.Manager)
+ 	v.ohm = v.Server.GetFeature(outbound.ManagerType()).(outbound.Manager)
+ 	v.dispatcher = v.Server.GetFeature(routing.DispatcherType()).(*dispatcher.DefaultDispatcher)
++	v.dispatcher.SetAuditSink(v.captureAuditHit)
+ 	return nil
+ }
+ 
+@@ -70,6 +74,9 @@ func (v *V2Core) Close() error {
+ 	v.Config = nil
+ 	v.ihm = nil
+ 	v.ohm = nil
++	if v.dispatcher != nil {
++		v.dispatcher.SetAuditSink(nil)
++	}
+ 	v.dispatcher = nil
+ 	err := v.Server.Close()
+ 	if err != nil {
+diff --git a/core/custom.go b/core/custom.go
+index b11f7df..3480b74 100644
+--- a/core/custom.go
++++ b/core/custom.go
+@@ -2,6 +2,7 @@ package core
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
+ 	"net"
+ 	"strings"
+ 
+@@ -83,6 +84,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
+ 			continue
+ 		}
+ 		for _, route := range info.Common.Routes {
++			auditRuleTag := fmt.Sprintf("audit:%d:%d:%s", info.Id, route.Id, route.Action)
+ 			switch route.Action {
+ 			case "dns":
+ 				if route.ActionValue == nil {
+@@ -103,6 +105,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
+ 					"inboundTag":  info.Tag,
+ 					"domain":      route.Match,
+ 					"outboundTag": "block",
++					"ruleTag":     auditRuleTag,
+ 				}
+ 				rawRule, err := json.Marshal(rule)
+ 				if err != nil {
+@@ -114,6 +117,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
+ 					"inboundTag":  info.Tag,
+ 					"ip":          route.Match,
+ 					"outboundTag": "block",
++					"ruleTag":     auditRuleTag,
+ 				}
+ 				rawRule, err := json.Marshal(rule)
+ 				if err != nil {
+@@ -125,6 +129,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
+ 					"inboundTag":  info.Tag,
+ 					"port":        strings.Join(route.Match, ","),
+ 					"outboundTag": "block",
++					"ruleTag":     auditRuleTag,
+ 				}
+ 				rawRule, err := json.Marshal(rule)
+ 				if err != nil {
+@@ -136,6 +141,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
+ 					"inboundTag":  info.Tag,
+ 					"protocol":    route.Match,
+ 					"outboundTag": "block",
++					"ruleTag":     auditRuleTag,
+ 				}
+ 				rawRule, err := json.Marshal(rule)
+ 				if err != nil {
+diff --git a/node/user.go b/node/user.go
+index ba9b2d5..52e252c 100644
+--- a/node/user.go
++++ b/node/user.go
+@@ -32,6 +32,18 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
+ 		}
+ 	}
+ 
++	auditEvents := c.server.DrainAuditEvents(c.info.Id, 256)
++	if auditErr := c.apiClient.ReportAuditEvents(ctx, auditEvents); auditErr != nil {
++		c.server.RequeueAuditEvents(auditEvents)
++		log.WithFields(log.Fields{
++			"tag": c.tag,
++			"err": auditErr,
++		}).Info("Report audit events failed")
++		if errors.Is(auditErr, context.Canceled) || errors.Is(auditErr, context.DeadlineExceeded) {
++			return auditErr
++		}
++	}
++
+ 	if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
+ 		log.WithFields(log.Fields{
+ 			"tag": c.tag,
