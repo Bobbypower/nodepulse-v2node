@@ -1,0 +1,87 @@
+diff --git a/conf/conf.go b/conf/conf.go
+index cf3a3f5..d281ed6 100644
+--- a/conf/conf.go
++++ b/conf/conf.go
+@@ -41,6 +41,8 @@ type NodeConfig struct {
+ 	Key        string `mapstructure:"ApiKey"`
+ 	Timeout    int    `mapstructure:"Timeout"`
+ 	RetryCount *int   `mapstructure:"RetryCount"`
++	ListenIP   string `mapstructure:"ListenIP"`
++	ListenPort int    `mapstructure:"ListenPort"`
+ }
+ 
+ func New() *Conf {
+diff --git a/node/node.go b/node/node.go
+index e8a2fda..ffc9642 100644
+--- a/node/node.go
++++ b/node/node.go
+@@ -29,12 +29,25 @@ func New(nodes []conf.NodeConfig) (*Node, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		applyLocalEndpointOverride(&node, info)
+ 		n.controllers[i] = NewController(p, &node, info)
+ 		n.NodeInfos[i] = info
+ 	}
+ 	return n, nil
+ }
+ 
++func applyLocalEndpointOverride(config *conf.NodeConfig, info *panel.NodeInfo) {
++	if config == nil || info == nil || info.Common == nil {
++		return
++	}
++	if config.ListenIP != "" {
++		info.Common.ListenIP = config.ListenIP
++	}
++	if config.ListenPort > 0 {
++		info.Common.ServerPort = config.ListenPort
++	}
++}
++
+ func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
+ 	for i, node := range nodes {
+ 		err := n.controllers[i].Start(core)
+diff --git a/node/node_local_endpoint_test.go b/node/node_local_endpoint_test.go
+new file mode 100644
+index 0000000..8156e99
+--- /dev/null
++++ b/node/node_local_endpoint_test.go
+@@ -0,0 +1,38 @@
++package node
++
++import (
++	"testing"
++
++	panel "github.com/wyx2685/v2node/api/v2board"
++	"github.com/wyx2685/v2node/conf"
++)
++
++func TestApplyLocalEndpointOverride(t *testing.T) {
++	info := &panel.NodeInfo{Common: &panel.CommonNode{
++		ListenIP:   "0.0.0.0",
++		ServerPort: 23334,
++	}}
++	config := &conf.NodeConfig{ListenIP: "::", ListenPort: 23335}
++
++	applyLocalEndpointOverride(config, info)
++
++	if info.Common.ListenIP != "::" {
++		t.Fatalf("listen IP = %q, want ::", info.Common.ListenIP)
++	}
++	if info.Common.ServerPort != 23335 {
++		t.Fatalf("listen port = %d, want 23335", info.Common.ServerPort)
++	}
++}
++
++func TestApplyLocalEndpointOverrideKeepsPanelEndpointByDefault(t *testing.T) {
++	info := &panel.NodeInfo{Common: &panel.CommonNode{
++		ListenIP:   "0.0.0.0",
++		ServerPort: 23334,
++	}}
++
++	applyLocalEndpointOverride(&conf.NodeConfig{}, info)
++
++	if info.Common.ListenIP != "0.0.0.0" || info.Common.ServerPort != 23334 {
++		t.Fatalf("endpoint = %s:%d, want panel endpoint", info.Common.ListenIP, info.Common.ServerPort)
++	}
++}
