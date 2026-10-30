@@ -1,0 +1,2199 @@
+diff --git a/node/lego.go b/node/lego.go
+--- a/node/lego.go
++++ b/node/lego.go
+@@ -1,46 +1,74 @@
+ package node
+ 
+ import (
++	"context"
+ 	"crypto"
+ 	"crypto/ecdsa"
+ 	"crypto/elliptic"
+ 	"crypto/rand"
++	"crypto/sha256"
+ 	"crypto/x509"
++	"encoding/json"
+ 	"encoding/pem"
+ 	"fmt"
+-	"os"
++	"io"
++	"net/http"
+ 	"path"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+-	"encoding/json"
+-
++	"github.com/go-acme/lego/v4/certcrypto"
+ 	"github.com/go-acme/lego/v4/certificate"
+ 	"github.com/go-acme/lego/v4/challenge/http01"
+-	"github.com/go-acme/lego/v4/providers/dns"
++	"github.com/go-acme/lego/v4/lego"
+ 	"github.com/go-acme/lego/v4/registration"
+-
+-	"github.com/go-acme/lego/v4/certcrypto"
+-	"github.com/go-acme/lego/v4/lego"
+ 	panel "github.com/wyx2685/v2node/api/v2board"
+ 	"github.com/wyx2685/v2node/common/file"
++	"github.com/xtls/xray-core/common/platform/filesystem"
+ )
+ 
+ type Lego struct {
+ 	client *lego.Client
+ 	config *panel.CertInfo
++	ctx    context.Context
+ }
+ 
+ func NewLego(config *panel.CertInfo) (*Lego, error) {
+-	user, err := NewLegoUser(path.Join(path.Dir(config.CertFile),
+-		"user",
+-		fmt.Sprintf("user-%s.json", config.Email)),
+-		config.Email)
++	return newLegoWithContext(context.Background(), config)
++}
++
++func newLegoWithContext(ctx context.Context, config *panel.CertInfo) (*Lego, error) {
++	if config == nil {
++		return nil, fmt.Errorf("certificate configuration is missing")
++	}
++	if config.CertMode != "http" {
++		return nil, fmt.Errorf("node-local ACME supports HTTP-01 only; use the central DNS broker and file mode for DNS-01")
++	}
++	if len(config.DNSEnv) != 0 {
++		return nil, fmt.Errorf("DNS credentials in node configuration are forbidden; use a trusted central issuer with file mode")
++	}
++	accountID := fmt.Sprintf("%x", sha256.Sum256([]byte(config.Email)))
++	accountDir := path.Join(path.Dir(config.CertFile), "user")
++	if err := filesystem.EnsurePrivateDirectory(accountDir); err != nil {
++		return nil, err
++	}
++	accountFile := path.Join(accountDir, "account-"+accountID+".json")
++	// Continue using an existing account and tighten it instead of registering
++	// a new ACME identity during the permission upgrade.
++	if !strings.ContainsAny(config.Email, `/\`) {
++		legacy := path.Join(accountDir, fmt.Sprintf("user-%s.json", config.Email))
++		if file.IsExist(legacy) {
++			accountFile = legacy
++		}
++	}
++	user, err := NewLegoUser(accountFile, config.Email)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("create user error: %s", err)
+ 	}
+ 	c := lego.NewConfig(user)
+ 	c.Certificate.KeyType = certcrypto.RSA2048
++	c.HTTPClient = &http.Client{Timeout: 30 * time.Second, Transport: certContextTransport{ctx: ctx}}
+ 	client, err := lego.NewClient(c)
+ 	if err != nil {
+ 		return nil, err
+@@ -48,22 +76,13 @@
+ 	l := Lego{
+ 		client: client,
+ 		config: config,
++		ctx:    ctx,
+ 	}
+ 	err = l.SetProvider()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("set provider error: %s", err)
+ 	}
+ 	return &l, nil
+-}
+-
+-func checkPath(p string) error {
+-	if !file.IsExist(path.Dir(p)) {
+-		err := os.MkdirAll(path.Dir(p), 0755)
+-		if err != nil {
+-			return fmt.Errorf("create dir error: %s", err)
+-		}
+-	}
+-	return nil
+ }
+ 
+ func (l *Lego) SetProvider() error {
+@@ -74,22 +93,15 @@
+ 			return err
+ 		}
+ 	case "dns":
+-		for k, v := range l.config.DNSEnv {
+-			os.Setenv(k, v)
+-		}
+-		p, err := dns.NewDNSChallengeProviderByName(l.config.Provider)
+-		if err != nil {
+-			return fmt.Errorf("create dns challenge provider error: %s", err)
+-		}
+-		err = l.client.Challenge.SetDNS01Provider(p)
+-		if err != nil {
+-			return fmt.Errorf("set dns provider error: %s", err)
+-		}
+-	}
+-	return nil
+-}
+-
+-func (l *Lego) CreateCert() (err error) {
++		return fmt.Errorf("node-local DNS signing is disabled; use the central DNS broker and file mode")
++	}
++	return nil
++}
++
++func (l *Lego) CreateCert() error {
++	return filesystem.WithPrivateFileLock(l.parseParams(l.config.KeyFile)+".acme.lock", l.createCert)
++}
++func (l *Lego) createCert() (err error) {
+ 	request := certificate.ObtainRequest{
+ 		Domains: []string{l.config.CertDomain},
+ 		Bundle:  true,
+@@ -106,14 +118,19 @@
+ }
+ 
+ func (l *Lego) RenewCert() error {
+-	file, err := os.ReadFile(l.config.CertFile)
++	return filesystem.WithPrivateFileLock(l.parseParams(l.config.KeyFile)+".acme.lock", l.renewCert)
++}
++func (l *Lego) renewCert() error {
++	file, _, err := filesystem.ReadCertificatePair(l.parseParams(l.config.CertFile), l.parseParams(l.config.KeyFile))
+ 	if err != nil {
+ 		return fmt.Errorf("read cert file error: %s", err)
+ 	}
+-	if e, err := l.CheckCert(file); !e {
++	due, err := l.CheckCert(file)
++	if err != nil {
++		return fmt.Errorf("check cert error: %s", err)
++	}
++	if !due {
+ 		return nil
+-	} else if err != nil {
+-		return fmt.Errorf("check cert error: %s", err)
+ 	}
+ 	res, err := l.client.Certificate.Renew(certificate.Resource{
+ 		Domain:      l.config.CertDomain,
+@@ -134,8 +151,7 @@
+ 	if err != nil {
+ 		return false, err
+ 	}
+-	notAfter := int(time.Until(cert.NotAfter).Hours() / 24.0)
+-	if notAfter > 30 {
++	if time.Until(cert.NotAfter) > 30*24*time.Hour {
+ 		return false, nil
+ 	}
+ 	return true, nil
+@@ -146,23 +162,13 @@
+ 	return r.Replace(path)
+ }
+ func (l *Lego) writeCert(certificates *certificate.Resource) error {
+-	err := checkPath(l.config.CertFile)
+-	if err != nil {
+-		return fmt.Errorf("check path error: %s", err)
+-	}
+-	err = os.WriteFile(l.parseParams(l.config.CertFile), certificates.Certificate, 0644)
+-	if err != nil {
+-		return err
+-	}
+-	err = checkPath(l.config.KeyFile)
+-	if err != nil {
+-		return fmt.Errorf("check path error: %s", err)
+-	}
+-	err = os.WriteFile(l.parseParams(l.config.KeyFile), certificates.PrivateKey, 0644)
+-	if err != nil {
+-		return err
+-	}
+-	return nil
++	if l.ctx != nil && l.ctx.Err() != nil {
++		return l.ctx.Err()
++	}
++	if certificates == nil {
++		return fmt.Errorf("certificate result is missing")
++	}
++	return filesystem.WriteCertificatePair(l.parseParams(l.config.CertFile), l.parseParams(l.config.KeyFile), certificates.Certificate, certificates.PrivateKey, l.config.CertDomain)
+ }
+ 
+ type User struct {
+@@ -182,7 +188,16 @@
+ 	return u.key
+ }
+ 
+-func NewLegoUser(path string, email string) (*User, error) {
++func NewLegoUser(name string, email string) (*User, error) {
++	var user *User
++	err := filesystem.WithPrivateFileLock(name+".lock", func() error {
++		var err error
++		user, err = loadOrRegisterLegoUser(name, email)
++		return err
++	})
++	return user, err
++}
++func loadOrRegisterLegoUser(path string, email string) (*User, error) {
+ 	var user User
+ 	if file.IsExist(path) {
+ 		err := user.Load(path)
+@@ -238,33 +253,36 @@
+ 	pemEncoded := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: encoded})
+ 	return string(pemEncoded), nil
+ }
+-func (u *User) Save(path string) error {
+-	err := checkPath(path)
+-	if err != nil {
+-		return fmt.Errorf("check path error: %s", err)
+-	}
+-	u.KeyEncoded, _ = EncodePrivate(u.key.(*ecdsa.PrivateKey))
+-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
++func (u *User) Save(name string) error {
++	key, ok := u.key.(*ecdsa.PrivateKey)
++	if !ok {
++		return fmt.Errorf("unsupported ACME account key")
++	}
++	encoded, err := EncodePrivate(key)
+ 	if err != nil {
+ 		return err
+ 	}
+-	err = json.NewEncoder(f).Encode(u)
+-	if err != nil {
+-		return fmt.Errorf("marshal json error: %s", err)
+-	}
+-	u.KeyEncoded = ""
+-	return nil
++	saved := *u
++	saved.KeyEncoded = encoded
++	data, err := json.Marshal(&saved)
++	if err != nil {
++		return fmt.Errorf("encode ACME account failed")
++	}
++	return filesystem.WritePrivateFile(name, data)
+ }
+ 
+ func (u *User) DecodePrivate(pemEncodedPriv string) (*ecdsa.PrivateKey, error) {
+ 	blockPriv, _ := pem.Decode([]byte(pemEncodedPriv))
++	if blockPriv == nil {
++		return nil, fmt.Errorf("invalid ACME account private key PEM")
++	}
+ 	x509EncodedPriv := blockPriv.Bytes
+ 	privateKey, err := x509.ParseECPrivateKey(x509EncodedPriv)
+ 	return privateKey, err
+ }
+ 
+ func (u *User) Load(path string) error {
+-	data, err := os.ReadFile(path)
++	data, err := filesystem.ReadPrivateFile(path)
+ 	if err != nil {
+ 		return fmt.Errorf("open file error: %s", err)
+ 	}
+@@ -274,8 +292,48 @@
+ 		return fmt.Errorf("unmarshal json error: %s", err)
+ 	}
+ 	u.key, err = u.DecodePrivate(u.KeyEncoded)
++	u.KeyEncoded = ""
+ 	if err != nil {
+ 		return fmt.Errorf("decode private key error: %s", err)
+ 	}
+ 	return nil
+ }
++
++// ACME requests inherit the renewal task deadline. Node payloads cannot install
++// process-wide DNS credentials. The central issuer uses a separate process.
++type certContextTransport struct{ ctx context.Context }
++
++func (t certContextTransport) RoundTrip(r *http.Request) (*http.Response, error) {
++	// Preserve the client's per-request deadline as well as task cancellation.
++	// Cancellation must live until the response body is consumed, not merely
++	// until response headers arrive.
++	ctx, cancel := context.WithCancel(r.Context())
++	parent := t.ctx
++	if parent == nil {
++		parent = context.Background()
++	}
++	stop := context.AfterFunc(parent, cancel)
++	var once sync.Once
++	finish := func() { once.Do(func() { stop(); cancel() }) }
++	response, err := http.DefaultTransport.RoundTrip(r.Clone(ctx))
++	if err != nil {
++		finish()
++		return nil, err
++	}
++	response.Body = &certContextBody{ReadCloser: response.Body, finish: finish}
++	return response, nil
++}
++
++type certContextBody struct {
++	io.ReadCloser
++	finish func()
++}
++
++func (b *certContextBody) Read(p []byte) (int, error) {
++	n, err := b.ReadCloser.Read(p)
++	if err != nil {
++		b.finish()
++	}
++	return n, err
++}
++func (b *certContextBody) Close() error { err := b.ReadCloser.Close(); b.finish(); return err }
+diff --git a/node/cert.go b/node/cert.go
+--- a/node/cert.go
++++ b/node/cert.go
+@@ -1,6 +1,7 @@
+ package node
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/rand"
+ 	"crypto/rsa"
+@@ -9,22 +10,22 @@
+ 	"encoding/pem"
+ 	"fmt"
+ 	"math/big"
+-	"os"
+ 	"time"
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	"github.com/wyx2685/v2node/common/file"
++	"github.com/xtls/xray-core/common/platform/filesystem"
+ )
+ 
+-func (c *Controller) renewCertTask(_ context.Context) error {
+-	l, err := NewLego(c.info.Common.CertInfo)
++func (c *Controller) renewCertTask(ctx context.Context) error {
++	l, err := newLegoWithContext(ctx, c.info.Common.CertInfo)
+ 	if err != nil {
+-		log.WithField("tag", c.tag).Info("new lego error: ", err)
++		log.WithField("tag", c.tag).Error("certificate renewal setup failed; retaining active certificate")
+ 		return nil
+ 	}
+ 	err = l.RenewCert()
+ 	if err != nil {
+-		log.WithField("tag", c.tag).Info("renew cert error: ", err)
++		log.WithField("tag", c.tag).Error("certificate renewal failed; retaining active certificate")
+ 		return nil
+ 	}
+ 	return nil
+@@ -32,17 +33,48 @@
+ 
+ func (c *Controller) requestCert() error {
+ 	cert := c.info.Common.CertInfo
++	if cert == nil {
++		return fmt.Errorf("certificate configuration is missing")
++	}
++	if len(cert.DNSEnv) != 0 {
++		return fmt.Errorf("DNS credentials in node configuration are forbidden; use central issuance")
++	}
++	if file.IsExist(cert.KeyFile) {
++		if _, err := filesystem.ReadPrivateFile(cert.KeyFile); err != nil {
++			return err
++		}
++	}
+ 	switch cert.CertMode {
+ 	case "none", "":
+ 	case "file":
++		certPEM, keyPEM, err := filesystem.ReadCertificatePair(cert.CertFile, cert.KeyFile)
++		if err != nil {
++			return err
++		}
++		return filesystem.ValidateCertificatePair(certPEM, keyPEM, cert.CertDomain, time.Now())
++	case "dns":
++		return fmt.Errorf("node-local DNS signing is disabled; use central issuance and file mode")
++	case "http":
+ 		if cert.CertFile == "" || cert.KeyFile == "" {
+ 			return fmt.Errorf("cert file path or key file path not exist")
+ 		}
+-	case "dns", "http":
+-		if cert.CertFile == "" || cert.KeyFile == "" {
+-			return fmt.Errorf("cert file path or key file path not exist")
+-		}
+-		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
++		if file.IsExist(cert.KeyFile) {
++			certPEM, keyPEM, err := filesystem.ReadCertificatePair(cert.CertFile, cert.KeyFile)
++			if err != nil {
++				return err
++			}
++			// A managed issuer may rotate after startup. Expired ACME files
++			// are renewed synchronously before the listener is opened.
++			if err := filesystem.ValidateCertificatePair(certPEM, keyPEM, cert.CertDomain, time.Now()); err != nil {
++				if cert.CertMode == "http" || cert.CertMode == "dns" {
++					l, err := NewLego(cert)
++					if err != nil {
++						return err
++					}
++					return l.CreateCert()
++				}
++				return err
++			}
+ 			return nil
+ 		}
+ 		l, err := NewLego(cert)
+@@ -57,7 +89,14 @@
+ 		if cert.CertFile == "" || cert.KeyFile == "" {
+ 			return fmt.Errorf("cert file path or key file path not exist")
+ 		}
+-		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
++		if file.IsExist(cert.KeyFile) {
++			certPEM, keyPEM, err := filesystem.ReadCertificatePair(cert.CertFile, cert.KeyFile)
++			if err != nil {
++				return err
++			}
++			if err := filesystem.ValidateCertificatePair(certPEM, keyPEM, cert.CertDomain, time.Now()); err != nil {
++				return err
++			}
+ 			return nil
+ 		}
+ 		err := generateSelfSslCertificate(
+@@ -71,17 +110,21 @@
+ 		if cert.CertFile == "" || cert.KeyFile == "" {
+ 			return fmt.Errorf("cert file path or key file path not exist")
+ 		}
+-		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
++		if file.IsExist(cert.KeyFile) {
++			certPEM, keyPEM, err := filesystem.ReadCertificatePair(cert.CertFile, cert.KeyFile)
++			if err != nil {
++				return err
++			}
++			if err := filesystem.ValidateCertificatePair(certPEM, keyPEM, cert.CertDomain, time.Now()); err != nil {
++				return err
++			}
+ 			return nil
+ 		}
+ 		if cert.TlsCert == "" || cert.TlsKey == "" {
+ 			return fmt.Errorf("tls cert or tls key not exist")
+ 		}
+-		if err := os.WriteFile(cert.CertFile, []byte(cert.TlsCert), 0644); err != nil {
+-			return fmt.Errorf("write remote cert error: %s", err)
+-		}
+-		if err := os.WriteFile(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
+-			return fmt.Errorf("write remote key error: %s", err)
++		if err := filesystem.WriteCertificatePair(cert.CertFile, cert.KeyFile, []byte(cert.TlsCert), []byte(cert.TlsKey), cert.CertDomain); err != nil {
++			return err
+ 		}
+ 
+ 	default:
+@@ -91,7 +134,10 @@
+ }
+ 
+ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
+-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		return err
++	}
+ 	tmpl := &x509.Certificate{
+ 		Version:      3,
+ 		SerialNumber: big.NewInt(time.Now().Unix()),
+@@ -109,27 +155,13 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	f, err := os.OpenFile(certPath, os.O_CREATE|os.O_RDWR, 0644)
+-	if err != nil {
++
++	var certPEM, keyPEM bytes.Buffer
++	if err := pem.Encode(&certPEM, &pem.Block{Type: "CERTIFICATE", Bytes: cert}); err != nil {
+ 		return err
+ 	}
+-	err = pem.Encode(f, &pem.Block{
+-		Type:  "CERTIFICATE",
+-		Bytes: cert,
+-	})
+-	if err != nil {
++	if err := pem.Encode(&keyPEM, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
+ 		return err
+ 	}
+-	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_RDWR, 0644)
+-	if err != nil {
+-		return err
+-	}
+-	err = pem.Encode(f, &pem.Block{
+-		Type:  "EC PRIVATE KEY",
+-		Bytes: x509.MarshalPKCS1PrivateKey(key),
+-	})
+-	if err != nil {
+-		return err
+-	}
+-	return nil
++	return filesystem.WriteCertificatePair(certPath, keyPath, certPEM.Bytes(), keyPEM.Bytes(), domain)
+ }
+diff --git a/node/cert_lifecycle_test.go b/node/cert_lifecycle_test.go
+new file mode 100644
+--- /dev/null
++++ b/node/cert_lifecycle_test.go
+@@ -0,0 +1,205 @@
++//go:build linux
++
++package node
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"encoding/pem"
++	"io"
++	"math/big"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/go-acme/lego/v4/certificate"
++	"github.com/go-acme/lego/v4/challenge/http01"
++	panel "github.com/wyx2685/v2node/api/v2board"
++	"github.com/xtls/xray-core/common/platform/filesystem"
++)
++
++func TestACMETransportPreservesBodyAndRequestTimeout(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/complete" {
++			io.WriteString(w, "synthetic-complete-response")
++			return
++		}
++		w.WriteHeader(http.StatusOK)
++		w.(http.Flusher).Flush()
++		<-r.Context().Done()
++	}))
++	defer server.Close()
++	client := &http.Client{Timeout: 200 * time.Millisecond, Transport: certContextTransport{ctx: context.Background()}}
++	response, err := client.Get(server.URL + "/complete")
++	if err != nil {
++		t.Fatal(err)
++	}
++	body, err := io.ReadAll(response.Body)
++	response.Body.Close()
++	if err != nil || string(body) != "synthetic-complete-response" {
++		t.Fatal("transport canceled body before it was consumed")
++	}
++	response, err = client.Get(server.URL + "/stall")
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, err = io.ReadAll(response.Body)
++	response.Body.Close()
++	if err == nil {
++		t.Fatal("transport lost the HTTP client's response deadline")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	client = &http.Client{Timeout: 2 * time.Second, Transport: certContextTransport{ctx: ctx}}
++	response, err = client.Get(server.URL + "/stall")
++	if err != nil {
++		t.Fatal(err)
++	}
++	cancel()
++	_, err = io.ReadAll(response.Body)
++	response.Body.Close()
++	if err == nil {
++		t.Fatal("transport ignored task cancellation")
++	}
++}
++
++func TestNativeHTTP01ProviderChallengeLifecycle(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	address := listener.Addr().String()
++	_, port, _ := net.SplitHostPort(address)
++	listener.Close()
++	provider := http01.NewProviderServer("127.0.0.1", port)
++	if err := provider.Present("node.example.invalid", "synthetic-token", "synthetic-key-authorization"); err != nil {
++		t.Fatal(err)
++	}
++	defer provider.CleanUp("node.example.invalid", "synthetic-token", "synthetic-key-authorization")
++	client := &http.Client{Timeout: 2 * time.Second}
++	request, err := http.NewRequest(http.MethodGet, "http://"+address+"/.well-known/acme-challenge/synthetic-token", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	request.Host = "node.example.invalid"
++	response, err := client.Do(request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer response.Body.Close()
++	body, _ := io.ReadAll(response.Body)
++	if response.StatusCode != 200 || string(body) != "synthetic-key-authorization" {
++		t.Fatal("HTTP-01 challenge did not return expected authorization")
++	}
++}
++
++func lifecyclePair(t *testing.T, days int) ([]byte, []byte) {
++	t.Helper()
++	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	c := &x509.Certificate{SerialNumber: big.NewInt(int64(days + 100)), DNSNames: []string{"node.example.invalid"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Duration(days) * 24 * time.Hour)}
++	der, err := x509.CreateCertificate(rand.Reader, c, c, k.Public(), k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	key, _ := x509.MarshalECPrivateKey(k)
++	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: key})
++}
++
++func TestDNSPayloadCredentialsRejectedWithoutGlobalEnvironmentMutation(t *testing.T) {
++	name := "NODEPULSE_CERT_SYNTHETIC_MARKER"
++	before, exists := os.LookupEnv(name)
++	config := &panel.CertInfo{CertMode: "dns", DNSEnv: map[string]string{name: "synthetic-credential-marker"}}
++	if _, err := NewLego(config); err == nil || strings.Contains(err.Error(), "synthetic-credential-marker") {
++		t.Fatal("credential payload not safely rejected")
++	}
++	if err := (&Lego{config: config}).SetProvider(); err == nil {
++		t.Fatal("provider accepted payload credentials")
++	}
++	after, nowExists := os.LookupEnv(name)
++	if exists != nowExists || before != after {
++		t.Fatal("process environment mutated")
++	}
++}
++
++func TestACMEAccountSaveLoadAndExistingPermissions(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "user")
++	if err := filesystem.EnsurePrivateDirectory(dir); err != nil {
++		t.Fatal(err)
++	}
++	name := filepath.Join(dir, "account.json")
++	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	u := &User{Email: "synthetic@example.invalid", key: k}
++	if err := u.Save(name); err != nil {
++		t.Fatal(err)
++	}
++	info, _ := os.Stat(name)
++	if info.Mode().Perm() != 0600 {
++		t.Fatal("account key not private")
++	}
++	os.Chmod(name, 0644)
++	loaded, err := NewLegoUser(name, u.Email)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if loaded.GetPrivateKey() == nil || loaded.KeyEncoded != "" {
++		t.Fatal("private account key retained in exported field")
++	}
++	info, _ = os.Stat(name)
++	if info.Mode().Perm() != 0600 {
++		t.Fatal("existing account not restricted")
++	}
++	if err := (&User{}).Save(name); err == nil {
++		t.Fatal("invalid account overwrote file")
++	}
++	var read User
++	if err := read.Load(name); err != nil {
++		t.Fatal("old account destroyed")
++	}
++	if _, err := u.DecodePrivate("malformed"); err == nil {
++		t.Fatal("malformed account did not fail safely")
++	}
++}
++
++func TestRenewalWindowAndMalformedInput(t *testing.T) {
++	l := &Lego{}
++	for _, item := range []struct {
++		days int
++		due  bool
++	}{{90, false}, {31, false}, {30, true}, {10, true}, {-1, true}} {
++		cert, _ := lifecyclePair(t, item.days)
++		due, err := l.CheckCert(cert)
++		if err != nil || due != item.due {
++			t.Fatalf("window %d: %v %v", item.days, due, err)
++		}
++	}
++	if _, err := l.CheckCert([]byte("bad")); err == nil {
++		t.Fatal("malformed cert silently ignored")
++	}
++}
++
++func TestLegoWriteUsesAtomicPairAndCancellationGuard(t *testing.T) {
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert"), filepath.Join(dir, "key")
++	cert, key := lifecyclePair(t, 90)
++	l := &Lego{config: &panel.CertInfo{CertFile: cp, KeyFile: kp, CertDomain: "node.example.invalid"}}
++	if err := l.writeCert(&certificate.Resource{Certificate: cert, PrivateKey: key}); err != nil {
++		t.Fatal(err)
++	}
++	info, _ := os.Stat(kp)
++	if info.Mode().Perm() != 0600 {
++		t.Fatal("leaf key not private")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	l.ctx = ctx
++	if err := l.writeCert(&certificate.Resource{Certificate: cert, PrivateKey: key}); err != context.Canceled {
++		t.Fatal("cancelled issuance committed")
++	}
++}
+diff --git a/cmd/cmd.go b/cmd/cmd.go
+--- a/cmd/cmd.go
++++ b/cmd/cmd.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	log "github.com/sirupsen/logrus"
++	"os"
+ 
+ 	"github.com/spf13/cobra"
+ )
+@@ -14,5 +15,6 @@
+ 	err := command.Execute()
+ 	if err != nil {
+ 		log.WithField("err", err).Error("Execute command failed")
++		os.Exit(1)
+ 	}
+ }
+diff --git a/cmd/certificate.go b/cmd/certificate.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/certificate.go
+@@ -0,0 +1,541 @@
++package cmd
++
++// Local-host certificate operations. These commands have no panel/token HTTP
++// endpoint: a trusted deployment channel must authenticate the host and user.
++// Private keys stay on the host. Only the CSR and public status reach stdout.
++import (
++	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/base64"
++	"encoding/json"
++	"encoding/pem"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/spf13/cobra"
++	"github.com/xtls/xray-core/common/platform/filesystem"
++)
++
++var certificateRequestID = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,80}$`)
++var certificateDNSLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
++
++func certificateDomainValid(domain string) bool {
++	name := domain
++	if net.ParseIP(name) != nil {
++		return false
++	}
++	if len(name) > 253 || !strings.Contains(name, ".") {
++		return false
++	}
++	for _, label := range strings.Split(name, ".") {
++		if len(label) > 63 || !certificateDNSLabel.MatchString(label) {
++			return false
++		}
++	}
++	return true
++}
++
++func createHostCSR(domain, keyPath, requestID string, binding ...string) ([]byte, error) {
++	if !certificateDomainValid(domain) || !certificateRequestID.MatchString(requestID) {
++		return nil, fmt.Errorf("invalid certificate domain or request ID")
++	}
++	bindingID := domain
++	if len(binding) > 0 {
++		bindingID = binding[0]
++	}
++	var csr []byte
++	err := filesystem.WithPrivateFileLock(keyPath+".certificate-operation.lock", func() error {
++		// A lost install receipt must not rotate the key when the same task
++		// requests its CSR again. Recover the original public CSR from the
++		// authoritative private PEM, after checking key/domain/profile binding.
++		if active, err := filesystem.ReadPrivateFile(keyPath); err == nil {
++			if block := hostPrivateKeyBlock(active); block != nil && block.Headers["NodePulse-Request"] == requestID {
++				cached, err := cachedHostCSR(block, domain, bindingID, requestID)
++				if err != nil {
++					return err
++				}
++				csr = cached
++				return nil
++			}
++		} else if !os.IsNotExist(err) {
++			return err
++		}
++		pending := keyPath + ".pending-" + requestID
++		data, err := filesystem.ReadPrivateFile(pending)
++		if err == nil {
++			block, _ := pem.Decode(data)
++			if block == nil || block.Headers["NodePulse-Domain"] != domain || block.Headers["NodePulse-Binding"] != bindingID {
++				return fmt.Errorf("pending key does not match certificate profile")
++			}
++			der, err := base64.StdEncoding.DecodeString(block.Headers["NodePulse-CSR"])
++			if err != nil {
++				return fmt.Errorf("invalid pending CSR")
++			}
++			request, err := x509.ParseCertificateRequest(der)
++			if err != nil || request.CheckSignature() != nil {
++				return fmt.Errorf("invalid pending CSR")
++			}
++			key, err := x509.ParseECPrivateKey(block.Bytes)
++			if err != nil {
++				return fmt.Errorf("invalid pending key")
++			}
++			public, err := x509.MarshalPKIXPublicKey(key.Public())
++			if err != nil || !bytes.Equal(public, request.RawSubjectPublicKeyInfo) || len(request.DNSNames) != 1 || request.DNSNames[0] != domain {
++				return fmt.Errorf("pending CSR does not match key or domain")
++			}
++			csr = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
++			return nil
++		}
++		if !os.IsNotExist(err) {
++			return err
++		}
++		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++		if err != nil {
++			return err
++		}
++		der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: domain}, DNSNames: []string{domain}}, key)
++		if err != nil {
++			return err
++		}
++		keyDER, err := x509.MarshalECPrivateKey(key)
++		if err != nil {
++			return err
++		}
++		previous := "none"
++		// Bind a CSR to the current active generation. A delayed job cannot
++		// overwrite a newer certificate installed after its CSR was created.
++		if active, _, readErr := filesystem.ReadCertificatePair("", keyPath); readErr == nil {
++			previous = pairFingerprint(active)
++		} else if !os.IsNotExist(readErr) {
++			// Separate legacy PEMs need the profile's certificate path; the
++			// caller supplies its pre-verified active fingerprint below.
++			if len(binding) < 2 {
++				return fmt.Errorf("active legacy certificate must be inspected before CSR creation")
++			}
++		}
++		if len(binding) > 1 {
++			previous = binding[1]
++		}
++		headers := map[string]string{"NodePulse-Domain": domain, "NodePulse-Binding": bindingID, "NodePulse-CSR": base64.StdEncoding.EncodeToString(der), "NodePulse-Request": requestID, "NodePulse-Previous": previous}
++		if err := filesystem.WritePrivateFile(pending, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER, Headers: headers})); err != nil {
++			return err
++		}
++		csr = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
++		return nil
++	})
++	return csr, err
++}
++
++func installHostCertificate(domain, certPath, keyPath, requestID string, cert []byte, binding ...string) error {
++	if !certificateDomainValid(domain) || !certificateRequestID.MatchString(requestID) {
++		return fmt.Errorf("invalid certificate domain or request ID")
++	}
++	return filesystem.WithPrivateFileLock(keyPath+".certificate-operation.lock", func() error {
++		bindingID := domain
++		if len(binding) > 0 {
++			bindingID = binding[0]
++		}
++		pending := keyPath + ".pending-" + requestID
++		key, err := filesystem.ReadPrivateFile(pending)
++		if os.IsNotExist(err) {
++			// Retry after a successful activation must not create a new key.
++			current, currentKey, readErr := filesystem.ReadCertificatePair(certPath, keyPath)
++			if readErr == nil && bytes.Equal(bytes.TrimSpace(current), bytes.TrimSpace(cert)) {
++				headers := hostPrivateKeyHeaders(currentKey)
++				if headers["NodePulse-Request"] != requestID || headers["NodePulse-Binding"] != bindingID || headers["NodePulse-Domain"] != domain {
++					return fmt.Errorf("persisted certificate does not belong to this request and profile")
++				}
++				return filesystem.ValidateCertificatePair(current, currentKey, domain, time.Now())
++			}
++		}
++		if err != nil {
++			return err
++		}
++		block, _ := pem.Decode(key)
++		if block == nil || block.Headers["NodePulse-Domain"] != domain || block.Headers["NodePulse-Binding"] != bindingID {
++			return fmt.Errorf("pending key does not match certificate profile")
++		}
++		if err := filesystem.ValidateCertificatePair(cert, key, domain, time.Now()); err != nil {
++			return err
++		}
++		current, currentKey, currentErr := filesystem.ReadCertificatePair(certPath, keyPath)
++		if currentErr == nil {
++			if bytes.Equal(bytes.TrimSpace(current), bytes.TrimSpace(cert)) {
++				if err := filesystem.ValidateCertificatePair(current, currentKey, domain, time.Now()); err != nil {
++					return err
++				}
++				return os.Remove(pending)
++			}
++			if pairFingerprint(current) != block.Headers["NodePulse-Previous"] {
++				return fmt.Errorf("active certificate changed since CSR creation")
++			}
++		} else if !os.IsNotExist(currentErr) {
++			return currentErr
++		} else if block.Headers["NodePulse-Previous"] != "none" {
++			return fmt.Errorf("active certificate disappeared since CSR creation")
++		}
++		if err := filesystem.WriteCertificatePair(certPath, keyPath, cert, key, domain); err != nil {
++			return err
++		}
++		return os.Remove(pending)
++	})
++}
++
++func hostPrivateKeyHeaders(data []byte) map[string]string {
++	if block := hostPrivateKeyBlock(data); block != nil {
++		return block.Headers
++	}
++	return nil
++}
++
++func hostPrivateKeyBlock(data []byte) *pem.Block {
++	for len(data) > 0 {
++		block, rest := pem.Decode(data)
++		if block == nil {
++			break
++		}
++		if strings.HasSuffix(block.Type, "PRIVATE KEY") {
++			return block
++		}
++		data = rest
++	}
++	return nil
++}
++
++func cachedHostCSR(block *pem.Block, domain, binding, request string) ([]byte, error) {
++	if block.Headers["NodePulse-Domain"] != domain || block.Headers["NodePulse-Binding"] != binding || block.Headers["NodePulse-Request"] != request {
++		return nil, fmt.Errorf("cached CSR does not match profile and request")
++	}
++	der, err := base64.StdEncoding.DecodeString(block.Headers["NodePulse-CSR"])
++	if err != nil {
++		return nil, fmt.Errorf("invalid cached CSR")
++	}
++	csr, err := x509.ParseCertificateRequest(der)
++	if err != nil || csr.CheckSignature() != nil {
++		return nil, fmt.Errorf("invalid cached CSR")
++	}
++	key, err := x509.ParseECPrivateKey(block.Bytes)
++	if err != nil {
++		return nil, fmt.Errorf("invalid cached private key")
++	}
++	public, err := x509.MarshalPKIXPublicKey(key.Public())
++	if err != nil || !bytes.Equal(public, csr.RawSubjectPublicKeyInfo) || len(csr.DNSNames) != 1 || csr.DNSNames[0] != domain {
++		return nil, fmt.Errorf("cached CSR key or domain mismatch")
++	}
++	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
++}
++
++type hostCertificateProfile struct {
++	ID          string `json:"profile_id"`
++	Domain      string `json:"domain"`
++	CertFile    string `json:"cert_file"`
++	KeyFile     string `json:"key_file"`
++	TrustMode   string `json:"trust_mode,omitempty"`
++	ClientRoute string `json:"client_route,omitempty"`
++}
++
++var hostProfileID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$`)
++var hostCertificateProfilesRoot = "/etc/nodepulse/certificates/profiles"
++var hostCertificateManagedRoot = "/etc/v2node"
++
++func loadHostCertificateProfile(root, id string) (*hostCertificateProfile, string, error) {
++	if !hostProfileID.MatchString(id) {
++		return nil, "", fmt.Errorf("invalid certificate profile ID")
++	}
++	data, err := filesystem.ReadPrivateFileStrict(filepath.Join(root, id+".json"))
++	if err != nil {
++		return nil, "", err
++	}
++	return parseHostCertificateProfile(data, id)
++}
++
++func parseHostCertificateProfile(data []byte, id string) (*hostCertificateProfile, string, error) {
++	if !hostProfileID.MatchString(id) {
++		return nil, "", fmt.Errorf("invalid certificate profile ID")
++	}
++	if len(data) > 32768 {
++		return nil, "", fmt.Errorf("certificate profile too large")
++	}
++	var profile hostCertificateProfile
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&profile); err != nil {
++		return nil, "", fmt.Errorf("invalid certificate profile")
++	}
++	if decoder.Decode(&struct{}{}) != io.EOF {
++		return nil, "", fmt.Errorf("invalid certificate profile trailing data")
++	}
++	if profile.ID != id || !certificateDomainValid(profile.Domain) || !filepath.IsAbs(profile.CertFile) || !filepath.IsAbs(profile.KeyFile) || filepath.Clean(profile.CertFile) == filepath.Clean(profile.KeyFile) {
++		return nil, "", fmt.Errorf("invalid certificate profile")
++	}
++	if filepath.Clean(profile.CertFile) != profile.CertFile || filepath.Clean(profile.KeyFile) != profile.KeyFile {
++		return nil, "", fmt.Errorf("certificate profile paths must be canonical")
++	}
++	if err := validateHostTrustPolicy(&profile); err != nil {
++		return nil, "", err
++	}
++	canonical, _ := json.Marshal(profile)
++	return &profile, fmt.Sprintf("%x", sha256.Sum256(canonical)), nil
++}
++
++// Called over the trusted deployment SSH channel, never over the shared node
++// API. Automatic initialization is restricted to this node's managed paths;
++// existing legacy profiles remain readable but cannot be silently overwritten.
++func initializeHostCertificateProfile(root, id string, nodeID int64, data []byte) (*hostCertificateProfile, string, error) {
++	profile, binding, err := parseHostCertificateProfile(data, id)
++	if err != nil {
++		return nil, "", err
++	}
++	if nodeID < 1 || nodeID > 9007199254740991 {
++		return nil, "", fmt.Errorf("invalid managed node ID")
++	}
++	stem := "vless" + strconv.FormatInt(nodeID, 10)
++	if profile.CertFile != filepath.Join(hostCertificateManagedRoot, stem+".cer") || profile.KeyFile != filepath.Join(hostCertificateManagedRoot, stem+".key") {
++		return nil, "", fmt.Errorf("automatic certificate profile must use this node's managed certificate paths")
++	}
++	if err := filesystem.EnsurePrivateDirectory(root); err != nil {
++		return nil, "", err
++	}
++	name := filepath.Join(root, id+".json")
++	err = filesystem.WithPrivateFileLock(name+".lock", func() error {
++		if previous, readErr := filesystem.ReadPrivateFile(name); readErr == nil {
++			_, old, err := parseHostCertificateProfile(previous, id)
++			if err != nil {
++				return err
++			}
++			if old != binding {
++				return fmt.Errorf("certificate profile is immutable; initialize a new approved profile ID")
++			}
++			return nil
++		} else if !os.IsNotExist(readErr) {
++			return readErr
++		}
++		canonical, err := json.Marshal(profile)
++		if err != nil {
++			return err
++		}
++		return filesystem.WritePrivateFile(name, canonical)
++	})
++	return profile, binding, err
++}
++
++func verifyIssuedChain(cert []byte, domain string, roots *x509.CertPool) error {
++	_, err := verifyIssuedChainExpiry(cert, domain, roots, false)
++	return err
++}
++func verifyIssuedChainExpiry(cert []byte, domain string, roots *x509.CertPool, forbidOriginCA bool) (time.Time, error) {
++	var chain []*x509.Certificate
++	for len(cert) > 0 {
++		block, rest := pem.Decode(cert)
++		if block == nil {
++			if len(bytes.TrimSpace(cert)) != 0 {
++				return time.Time{}, fmt.Errorf("invalid certificate chain")
++			}
++			break
++		}
++		if block.Type != "CERTIFICATE" {
++			return time.Time{}, fmt.Errorf("certificate input may contain certificates only")
++		}
++		parsed, err := x509.ParseCertificate(block.Bytes)
++		if err != nil {
++			return time.Time{}, fmt.Errorf("invalid certificate chain")
++		}
++		chain = append(chain, parsed)
++		cert = rest
++	}
++	if len(chain) == 0 {
++		return time.Time{}, fmt.Errorf("certificate chain missing")
++	}
++	intermediates := x509.NewCertPool()
++	for _, cert := range chain[1:] {
++		intermediates.AddCert(cert)
++	}
++	verified, err := chain[0].Verify(x509.VerifyOptions{DNSName: domain, Roots: roots, Intermediates: intermediates})
++	if err != nil {
++		return time.Time{}, fmt.Errorf("issued certificate chain is not trusted for profile domain")
++	}
++	var best time.Time
++	for _, path := range verified {
++		end := path[0].NotAfter
++		allowed := true
++		for _, item := range path {
++			if forbidOriginCA && cloudflareOriginPins[fmt.Sprintf("%x", sha256.Sum256(item.Raw))] {
++				allowed = false
++				break
++			}
++			if item.NotAfter.Before(end) {
++				end = item.NotAfter
++			}
++		}
++		if allowed && end.After(best) {
++			best = end
++		}
++	}
++	if best.IsZero() {
++		return time.Time{}, fmt.Errorf("public CA profile cannot trust Cloudflare Origin CA")
++	}
++	return best, nil
++}
++
++func pairFingerprint(cert []byte) string {
++	block, _ := pem.Decode(cert)
++	if block == nil {
++		return ""
++	}
++	return fmt.Sprintf("%x", sha256.Sum256(block.Bytes))
++}
++
++func rollbackHostCertificate(profile *hostCertificateProfile, expected, target string) error {
++	if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(expected) || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(target) {
++		return fmt.Errorf("invalid rollback fingerprint")
++	}
++	return filesystem.WithPrivateFileLock(profile.KeyFile+".certificate-operation.lock", func() error {
++		current, _, err := filesystem.ReadCertificatePair(profile.CertFile, profile.KeyFile)
++		if err != nil {
++			return err
++		}
++		if pairFingerprint(current) == target {
++			return nil
++		}
++		if pairFingerprint(current) != expected {
++			return fmt.Errorf("active certificate changed; rollback refused")
++		}
++		previous, err := filesystem.ReadPrivateFile(profile.KeyFile + ".previous")
++		if err != nil {
++			return err
++		}
++		var public []byte
++		rest := previous
++		for len(rest) > 0 {
++			block, next := pem.Decode(rest)
++			if block == nil {
++				break
++			}
++			if block.Type == "CERTIFICATE" {
++				public = append(public, pem.EncodeToMemory(block)...)
++			}
++			rest = next
++		}
++		if pairFingerprint(public) != target {
++			return fmt.Errorf("previous certificate does not match rollback target")
++		}
++		if _, err := verifyProfileCertificate(profile, public); err != nil {
++			return err
++		}
++		return filesystem.WriteCertificatePair(profile.CertFile, profile.KeyFile, public, previous, profile.Domain)
++	})
++}
++
++func init() {
++	group := &cobra.Command{Use: "certificate", Short: "Manage host-local certificate files without exporting private keys"}
++	for _, operation := range []string{"profile-init", "profile", "csr", "install", "inspect", "rollback"} {
++		op := operation
++		var profileID, requestID, expected, target string
++		var nodeID int64
++		action := &cobra.Command{Use: op, Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
++			var profile *hostCertificateProfile
++			var binding string
++			var err error
++			if op == "profile-init" {
++				data, readErr := io.ReadAll(io.LimitReader(cmd.InOrStdin(), 32769))
++				if readErr != nil {
++					return readErr
++				}
++				profile, binding, err = initializeHostCertificateProfile(hostCertificateProfilesRoot, profileID, nodeID, data)
++			} else {
++				profile, binding, err = loadHostCertificateProfile(hostCertificateProfilesRoot, profileID)
++			}
++			if err != nil {
++				return err
++			}
++			if op == "profile" || op == "profile-init" {
++				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"state": "profile", "profile_id": profile.ID, "domain": profile.Domain, "cert_file": profile.CertFile, "key_file": profile.KeyFile, "profile_sha256": binding, "runtime_uid": os.Geteuid(), "runtime_uid_source": "cli", "service_uid_verified": false, "trust_mode": profileTrustMode(profile), "client_route": profile.ClientRoute})
++			}
++			if op == "csr" {
++				previous := "none"
++				if cert, _, err := filesystem.ReadCertificatePair(profile.CertFile, profile.KeyFile); err == nil {
++					previous = pairFingerprint(cert)
++				} else if !os.IsNotExist(err) {
++					return err
++				}
++				csr, err := createHostCSR(profile.Domain, profile.KeyFile, requestID, binding, previous)
++				if err != nil {
++					return err
++				}
++				_, err = cmd.OutOrStdout().Write(csr)
++				return err
++			}
++			if op == "install" {
++				cert, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), (4<<20)+1))
++				if err != nil {
++					return err
++				}
++				if len(cert) > 4<<20 {
++					return fmt.Errorf("certificate input is too large")
++				}
++				if _, err := verifyProfileCertificate(profile, cert); err != nil {
++					return err
++				}
++				if err := installHostCertificate(profile.Domain, profile.CertFile, profile.KeyFile, requestID, cert, binding); err != nil {
++					return err
++				}
++			}
++			if op == "rollback" {
++				if err := rollbackHostCertificate(profile, expected, target); err != nil {
++					return err
++				}
++			}
++			cert, key, err := filesystem.ReadCertificatePair(profile.CertFile, profile.KeyFile)
++			if err != nil {
++				return err
++			}
++			if err := filesystem.ValidateCertificatePair(cert, key, profile.Domain, time.Now()); err != nil {
++				return err
++			}
++			effectiveExpiry, err := verifyProfileCertificate(profile, cert)
++			if err != nil {
++				return err
++			}
++			block, _ := pem.Decode(cert)
++			leaf, err := x509.ParseCertificate(block.Bytes)
++			if err != nil {
++				return err
++			}
++			headers := hostPrivateKeyHeaders(key)
++			if headers["NodePulse-Binding"] != "" && headers["NodePulse-Binding"] != binding {
++				return fmt.Errorf("persisted certificate belongs to a different profile revision")
++			}
++			return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"state": "persisted", "profile_id": profileID, "request_id": headers["NodePulse-Request"], "profile_sha256": binding, "sha256": fmt.Sprintf("%x", sha256.Sum256(leaf.Raw)), "not_after": leaf.NotAfter, "runtime_uid": os.Geteuid(), "tls_handshake_verified": false, "generation_bound": headers["NodePulse-Binding"] != "", "effective_not_after": effectiveExpiry})
++		}}
++		action.Flags().StringVar(&profileID, "profile-id", "", "Host-local approved certificate profile ID")
++		action.Flags().StringVar(&requestID, "request-id", "", "Stable issuance job ID (csr/install)")
++		action.MarkFlagRequired("profile-id")
++		if op == "profile-init" {
++			action.Flags().Int64Var(&nodeID, "node-id", 0, "Managed NodePulse node ID")
++			action.MarkFlagRequired("node-id")
++		}
++		if op == "csr" || op == "install" {
++			action.MarkFlagRequired("request-id")
++		}
++		if op == "rollback" {
++			action.Flags().StringVar(&expected, "expected-sha256", "", "Fingerprint expected to be active")
++			action.Flags().StringVar(&target, "target-sha256", "", "Exact previous certificate to restore")
++			action.MarkFlagRequired("expected-sha256")
++			action.MarkFlagRequired("target-sha256")
++		}
++		group.AddCommand(action)
++	}
++	command.AddCommand(group)
++}
+diff --git a/cmd/certificate_test.go b/cmd/certificate_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/certificate_test.go
+@@ -0,0 +1,263 @@
++//go:build linux
++
++package cmd
++
++import (
++	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"encoding/pem"
++	"math/big"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/platform/filesystem"
++)
++
++func signTestCSR(t *testing.T, csr []byte) ([]byte, []byte) {
++	t.Helper()
++	block, _ := pem.Decode(csr)
++	if block == nil {
++		t.Fatal("CSR PEM missing")
++	}
++	request, err := x509.ParseCertificateRequest(block.Bytes)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := request.CheckSignature(); err != nil {
++		t.Fatal(err)
++	}
++	ca, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	root := &x509.Certificate{SerialNumber: big.NewInt(1), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(365 * 24 * time.Hour)}
++	template := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), DNSNames: request.DNSNames, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(90 * 24 * time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, KeyUsage: x509.KeyUsageDigitalSignature}
++	der, err := x509.CreateCertificate(rand.Reader, template, root, request.PublicKey, ca)
++	if err != nil {
++		t.Fatal(err)
++	}
++	rootDER, err := x509.CreateCertificate(rand.Reader, root, root, ca.Public(), ca)
++	if err != nil {
++		t.Fatal(err)
++	}
++	chain := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
++	chain = append(chain, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})...)
++	return chain, request.RawSubjectPublicKeyInfo
++}
++
++func TestStaleIssuanceCannotOverwriteNewerCertificate(t *testing.T) {
++	dir := t.TempDir()
++	kp, cp := filepath.Join(dir, "key"), filepath.Join(dir, "cert")
++	base, _ := createHostCSR("node.example.invalid", kp, "initial_job_00")
++	initial, _ := signTestCSR(t, base)
++	if err := installHostCertificate("node.example.invalid", cp, kp, "initial_job_00", initial); err != nil {
++		t.Fatal(err)
++	}
++	a, _ := createHostCSR("node.example.invalid", kp, "parallel_job_A")
++	b, _ := createHostCSR("node.example.invalid", kp, "parallel_job_B")
++	ac, _ := signTestCSR(t, a)
++	bc, _ := signTestCSR(t, b)
++	if err := installHostCertificate("node.example.invalid", cp, kp, "parallel_job_A", ac); err != nil {
++		t.Fatal(err)
++	}
++	if err := installHostCertificate("node.example.invalid", cp, kp, "parallel_job_B", bc); err == nil {
++		t.Fatal("stale job overwrote newer certificate")
++	}
++	if err := installHostCertificate("node.example.invalid", cp, kp, "unrelated_job", ac); err == nil {
++		t.Fatal("another job claimed successful activation")
++	}
++}
++
++func TestProfileBindingAndGuardedRollback(t *testing.T) {
++	dir := t.TempDir()
++	kp, cp := filepath.Join(dir, "key"), filepath.Join(dir, "cert")
++	profile := &hostCertificateProfile{ID: "synthetic", Domain: "node.example.invalid", CertFile: cp, KeyFile: kp}
++	a, err := createHostCSR(profile.Domain, kp, "initial_job_01", "profile-revision-A")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := createHostCSR(profile.Domain, kp, "initial_job_01", "profile-revision-B"); err == nil {
++		t.Fatal("changed profile reused old CSR")
++	}
++	ac, _ := signTestCSR(t, a)
++	if err := installHostCertificate(profile.Domain, cp, kp, "initial_job_01", ac, "profile-revision-B"); err == nil {
++		t.Fatal("changed profile installed old task")
++	}
++	if err := installHostCertificate(profile.Domain, cp, kp, "initial_job_01", ac, "profile-revision-A"); err != nil {
++		t.Fatal(err)
++	}
++	b, _ := createHostCSR(profile.Domain, kp, "renewal_job_02", "profile-revision-A")
++	bc, _ := signTestCSR(t, b)
++	if err := installHostCertificate(profile.Domain, cp, kp, "renewal_job_02", bc, "profile-revision-A"); err != nil {
++		t.Fatal(err)
++	}
++	if err := rollbackHostCertificate(profile, pairFingerprint(ac), pairFingerprint(ac)); err == nil {
++		t.Fatal("rollback ignored changed current certificate")
++	}
++	current, _, _ := filesystem.ReadCertificatePair(cp, kp)
++	if pairFingerprint(current) != pairFingerprint(bc) {
++		t.Fatal("rejected rollback changed the current certificate")
++	}
++}
++
++func TestIssuedChainRequiresTrustedRootAndProfileName(t *testing.T) {
++	dir := t.TempDir()
++	csr, _ := createHostCSR("node.example.invalid", filepath.Join(dir, "key"), "synthetic_job_01")
++	chain, _ := signTestCSR(t, csr)
++	_, rest := pem.Decode(chain)
++	pool := x509.NewCertPool()
++	pool.AppendCertsFromPEM(rest)
++	if err := verifyIssuedChain(chain, "node.example.invalid", pool); err != nil {
++		t.Fatal(err)
++	}
++	if err := verifyIssuedChain(chain, "wrong.example.invalid", pool); err == nil {
++		t.Fatal("wrong certificate name accepted")
++	}
++	if err := verifyIssuedChain(chain, "node.example.invalid", x509.NewCertPool()); err == nil {
++		t.Fatal("untrusted CA accepted")
++	}
++	if err := verifyIssuedChain(append(chain, []byte("garbage")...), "node.example.invalid", pool); err == nil {
++		t.Fatal("malformed chain suffix accepted")
++	}
++}
++
++func TestHostCSRInstallAndIdempotentRetry(t *testing.T) {
++	dir := t.TempDir()
++	kp, cp := filepath.Join(dir, "key"), filepath.Join(dir, "cert")
++	id := "synthetic_job_01"
++	csr, err := createHostCSR("node.example.invalid", kp, id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if bytes.Contains(csr, []byte("PRIVATE KEY")) {
++		t.Fatal("private key exported in CSR output")
++	}
++	cert, pub := signTestCSR(t, csr)
++	csrAgain, err := createHostCSR("node.example.invalid", kp, id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(csr, csrAgain) {
++		t.Fatal("CSR retry was not byte stable")
++	}
++	_, pubAgain := signTestCSR(t, csrAgain)
++	if !bytes.Equal(pub, pubAgain) {
++		t.Fatal("CSR retry changed private key")
++	}
++	if _, err := os.Stat(kp); !os.IsNotExist(err) {
++		t.Fatal("CSR changed active key")
++	}
++	info, _ := os.Stat(kp + ".pending-" + id)
++	if info.Mode().Perm() != 0600 {
++		t.Fatal("pending key not private")
++	}
++	if err := installHostCertificate("node.example.invalid", cp, kp, id, cert); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := filesystem.ReadCertificatePair(cp, kp); err != nil {
++		t.Fatal(err)
++	}
++	if err := installHostCertificate("node.example.invalid", cp, kp, id, cert); err != nil {
++		t.Fatalf("successful install retry failed: %v", err)
++	}
++	if _, err := os.Stat(kp + ".pending-" + id); !os.IsNotExist(err) {
++		t.Fatal("pending key retained after success")
++	}
++	csrAfterInstall, err := createHostCSR("node.example.invalid", kp, id)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(csrAfterInstall, csr) {
++		t.Fatal("lost install receipt caused a new CSR")
++	}
++	if _, err := os.Stat(kp + ".pending-" + id); !os.IsNotExist(err) {
++		t.Fatal("CSR recovery generated a new pending private key")
++	}
++}
++
++func TestHostInstallFailureRetainsOldKeyAndPendingRetry(t *testing.T) {
++	dir := t.TempDir()
++	kp, cp := filepath.Join(dir, "key"), filepath.Join(dir, "cert")
++	a, _ := createHostCSR("node.example.invalid", kp, "initial_job_01")
++	cert, _ := signTestCSR(t, a)
++	if err := installHostCertificate("node.example.invalid", cp, kp, "initial_job_01", cert); err != nil {
++		t.Fatal(err)
++	}
++	old, _ := os.ReadFile(kp)
++	next, _ := createHostCSR("node.example.invalid", kp, "renewal_job_02")
++	newCert, _ := signTestCSR(t, next)
++	if err := installHostCertificate("node.example.invalid", cp, kp, "renewal_job_02", cert); err == nil {
++		t.Fatal("mismatched certificate accepted")
++	}
++	current, _ := os.ReadFile(kp)
++	if !bytes.Equal(old, current) {
++		t.Fatal("active key changed after failure")
++	}
++	if err := installHostCertificate("node.example.invalid", cp, kp, "renewal_job_02", newCert); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := createHostCSR("node.example.invalid", kp, "../../escape"); err == nil {
++		t.Fatal("unsafe request ID accepted")
++	}
++	if _, err := createHostCSR("invalid\nname", kp, "synthetic_job_03"); err == nil {
++		t.Fatal("unsafe name accepted")
++	}
++}
++
++func TestSameTaskRecoveryWaitsForHostOperationLock(t *testing.T) {
++	dir := t.TempDir()
++	keyPath, certPath := filepath.Join(dir, "key"), filepath.Join(dir, "cert")
++	domain, request := "node.example.invalid", "same_task_recovery"
++	csr, err := createHostCSR(domain, keyPath, request, "bound-profile")
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, _ := signTestCSR(t, csr)
++	held, release, unlocked := make(chan struct{}), make(chan struct{}), make(chan error, 1)
++	go func() {
++		unlocked <- filesystem.WithPrivateFileLock(keyPath+".certificate-operation.lock", func() error {
++			close(held)
++			<-release
++			return nil
++		})
++	}()
++	select {
++	case <-held:
++	case <-time.After(3 * time.Second):
++		t.Fatal("host lock not acquired")
++	}
++	finished := make(chan error, 1)
++	go func() { finished <- installHostCertificate(domain, certPath, keyPath, request, cert, "bound-profile") }()
++	select {
++	case err := <-finished:
++		close(release)
++		t.Fatalf("recovery escaped original host lock: %v", err)
++	case <-time.After(50 * time.Millisecond):
++	}
++	if _, err := os.Stat(certPath); !os.IsNotExist(err) {
++		close(release)
++		t.Fatal("locked recovery mutated active certificate")
++	}
++	close(release)
++	if err := <-unlocked; err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err := <-finished:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("recovery did not continue after original command exited")
++	}
++	// A lost receipt can safely repeat the same install and recover the same CSR.
++	if err := installHostCertificate(domain, certPath, keyPath, request, cert, "bound-profile"); err != nil {
++		t.Fatal(err)
++	}
++	recovered, err := createHostCSR(domain, keyPath, request, "bound-profile")
++	if err != nil || !bytes.Equal(csr, recovered) {
++		t.Fatal("same task rotated its CSR after receipt loss")
++	}
++}
+diff --git a/cmd/certificate_process_test.go b/cmd/certificate_process_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/certificate_process_test.go
+@@ -0,0 +1,246 @@
++//go:build linux
++
++package cmd
++
++import (
++	"bytes"
++	ctls "crypto/tls"
++	"crypto/x509"
++	"encoding/json"
++	"encoding/pem"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/platform/filesystem"
++	xtls "github.com/xtls/xray-core/transport/internet/tls"
++)
++
++// Only the test executable supports this profile-root override; the shipping
++// binary has no environment flag for selecting remote profile paths.
++func TestCertificateCLIProcess(t *testing.T) {
++	if os.Getenv("NODEPULSE_CERT_CLI_TEST_CHILD") == "1" {
++		hostCertificateProfilesRoot = os.Getenv("NODEPULSE_CERT_CLI_TEST_PROFILE_ROOT")
++		if root := os.Getenv("NODEPULSE_CERT_CLI_TEST_MANAGED_ROOT"); root != "" {
++			hostCertificateManagedRoot = root
++		}
++		if anchor := os.Getenv("NODEPULSE_CERT_CLI_TEST_ORIGIN_CA"); anchor != "" {
++			data, err := os.ReadFile(anchor)
++			if err != nil {
++				os.Exit(1)
++			}
++			cloudflareOriginRoots = func() (*x509.CertPool, error) {
++				pool := x509.NewCertPool()
++				if !pool.AppendCertsFromPEM(data) {
++					return nil, fmt.Errorf("invalid synthetic anchor")
++				}
++				return pool, nil
++			}
++		}
++		for i, arg := range os.Args {
++			if arg == "--" {
++				command.SetArgs(os.Args[i+1:])
++				break
++			}
++		}
++		Run()
++		os.Exit(0)
++	}
++	dir := t.TempDir()
++	profiles := filepath.Join(dir, "profiles")
++	if err := filesystem.EnsurePrivateDirectory(profiles); err != nil {
++		t.Fatal(err)
++	}
++	profile := hostCertificateProfile{ID: "synthetic", Domain: "node.example.invalid", CertFile: filepath.Join(dir, "vless902.cer"), KeyFile: filepath.Join(dir, "vless902.key"), TrustMode: "public_ca", ClientRoute: "dns_split"}
++	data, _ := json.Marshal(profile)
++	caFile := filepath.Join(dir, "roots.pem")
++	executable, _ := os.Executable()
++	invoke := func(input []byte, args ...string) ([]byte, error) {
++		child := exec.Command(executable, append([]string{"-test.run=^TestCertificateCLIProcess$", "--", "certificate"}, args...)...)
++		child.Env = append(os.Environ(), "NODEPULSE_CERT_CLI_TEST_CHILD=1", "NODEPULSE_CERT_CLI_TEST_PROFILE_ROOT="+profiles, "NODEPULSE_CERT_CLI_TEST_MANAGED_ROOT="+dir, "SSL_CERT_FILE="+caFile, "SSL_CERT_DIR="+filepath.Join(dir, "empty-root-dir"))
++		child.Stdin = bytes.NewReader(input)
++		var out, errout bytes.Buffer
++		child.Stdout = &out
++		child.Stderr = &errout
++		err := child.Run()
++		if err != nil {
++			return out.Bytes(), fmt.Errorf("%w: %s", err, errout.String())
++		}
++		return out.Bytes(), nil
++	}
++	if _, err := invoke(data, "profile-init", "--profile-id", "synthetic", "--node-id", "902"); err != nil {
++		t.Fatal(err)
++	}
++	profileOut, err := invoke(nil, "profile", "--profile-id", "synthetic")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var metadata map[string]any
++	if err := json.Unmarshal(profileOut, &metadata); err != nil {
++		t.Fatal(err)
++	}
++	if metadata["domain"] != profile.Domain || metadata["cert_file"] != profile.CertFile || metadata["key_file"] != profile.KeyFile || metadata["service_uid_verified"] != false || metadata["runtime_uid_source"] != "cli" {
++		t.Fatal("profile preflight overstated identity")
++	}
++	if _, err := os.Stat(profile.KeyFile); !os.IsNotExist(err) {
++		t.Fatal("profile preflight created a private key")
++	}
++	csr, err := invoke(nil, "csr", "--profile-id", "synthetic", "--request-id", "initial_job_01")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if bytes.Contains(csr, []byte("PRIVATE KEY")) {
++		t.Fatal("CLI exported private key")
++	}
++	cert, _ := signTestCSR(t, csr)
++	_, ca := pem.Decode(cert)
++	if err := os.WriteFile(caFile, ca, 0644); err != nil {
++		t.Fatal(err)
++	}
++	out, err := invoke(cert, "install", "--profile-id", "synthetic", "--request-id", "initial_job_01")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var receipt map[string]any
++	if err := json.Unmarshal(out, &receipt); err != nil {
++		t.Fatal(err)
++	}
++	if receipt["state"] != "persisted" || receipt["request_id"] != "initial_job_01" || receipt["tls_handshake_verified"] != false || receipt["sha256"] != pairFingerprint(cert) {
++		t.Fatal("CLI gave a false execution receipt")
++	}
++	retryCSR, err := invoke(nil, "csr", "--profile-id", "synthetic", "--request-id", "initial_job_01")
++	if err != nil || !bytes.Equal(retryCSR, csr) {
++		t.Fatal("install receipt recovery generated a new CSR")
++	}
++	if _, err := os.Stat(profile.KeyFile + ".pending-initial_job_01"); !os.IsNotExist(err) {
++		t.Fatal("installed CSR recovery generated a new pending key")
++	}
++	inspect, err := invoke(nil, "inspect", "--profile-id", "synthetic", "--request-id", "unrelated_input")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if exportDir := os.Getenv("NODEPULSE_CERT_TEST_PUBLIC_RECEIPTS"); exportDir != "" {
++		if err := os.MkdirAll(exportDir, 0700); err != nil {
++			t.Fatal(err)
++		}
++		for name, data := range map[string][]byte{"profile.json": profileOut, "csr.pem": csr, "certificate.pem": cert, "install.json": out, "inspect.json": inspect} {
++			if err := os.WriteFile(filepath.Join(exportDir, name), data, 0600); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	var seen map[string]any
++	json.Unmarshal(inspect, &seen)
++	if seen["request_id"] != "initial_job_01" {
++		t.Fatal("inspect echoed supplied request ID")
++	}
++	if _, err := invoke(nil, "csr", "--profile-id", "../invalid", "--request-id", "initial_job_01"); err == nil {
++		t.Fatal("invalid operation returned exit 0")
++	}
++	public, key, err := filesystem.ReadCertificatePair(profile.CertFile, profile.KeyFile)
++	if err != nil {
++		t.Fatal(err)
++	}
++	config := (&xtls.Config{Certificate: []*xtls.Certificate{{Certificate: public, Key: key, CertificatePath: profile.CertFile, KeyPath: profile.KeyFile}}, RejectUnknownSni: true}).GetTLSConfig()
++	listener, err := ctls.Listen("tcp", "127.0.0.1:0", config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func(conn net.Conn) {
++				defer conn.Close()
++				conn.SetDeadline(time.Now().Add(25 * time.Second))
++				io.Copy(conn, conn)
++			}(conn)
++		}
++	}()
++	pool := x509.NewCertPool()
++	pool.AppendCertsFromPEM(ca)
++	connect := func() *ctls.Conn {
++		t.Helper()
++		conn, err := ctls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", listener.Addr().String(), &ctls.Config{RootCAs: pool, ServerName: profile.Domain})
++		if err != nil {
++			t.Fatal(err)
++		}
++		return conn
++	}
++	oldConnection := connect()
++	defer oldConnection.Close()
++	oldConnection.SetDeadline(time.Now().Add(20 * time.Second))
++	if _, err := oldConnection.Write([]byte("a")); err != nil {
++		t.Fatal(err)
++	}
++	var echoed [1]byte
++	if _, err := io.ReadFull(oldConnection, echoed[:]); err != nil || echoed[0] != 'a' {
++		t.Fatal("initial TLS exchange failed")
++	}
++	nextCSR, err := invoke(nil, "csr", "--profile-id", "synthetic", "--request-id", "renewal_job_02")
++	if err != nil {
++		t.Fatal(err)
++	}
++	nextCert, _ := signTestCSR(t, nextCSR)
++	_, nextCA := pem.Decode(nextCert)
++	if _, err := invoke(nextCert, "install", "--profile-id", "synthetic", "--request-id", "renewal_job_02"); err == nil {
++		t.Fatal("CLI installed an untrusted new CA")
++	}
++	stillOld, _, readErr := filesystem.ReadCertificatePair(profile.CertFile, profile.KeyFile)
++	if readErr != nil || pairFingerprint(stillOld) != pairFingerprint(cert) {
++		t.Fatal("untrusted issuance replaced active certificate")
++	}
++	pool.AppendCertsFromPEM(nextCA)
++	os.WriteFile(caFile, append(append([]byte{}, ca...), nextCA...), 0644)
++	if _, err := invoke(nextCert, "install", "--profile-id", "synthetic", "--request-id", "renewal_job_02"); err != nil {
++		t.Fatal(err)
++	}
++	nextBlock, _ := pem.Decode(nextCert)
++	deadline := time.Now().Add(8 * time.Second)
++	for {
++		conn := connect()
++		got := conn.ConnectionState().PeerCertificates[0].Raw
++		conn.Close()
++		if bytes.Equal(got, nextBlock.Bytes) {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("CLI installed but actual TLS did not load renewed certificate")
++		}
++		time.Sleep(200 * time.Millisecond)
++	}
++	if _, err := oldConnection.Write([]byte("b")); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := io.ReadFull(oldConnection, echoed[:]); err != nil || echoed[0] != 'b' {
++		t.Fatal("renewal disrupted existing TLS session")
++	}
++	if _, err := invoke(nil, "rollback", "--profile-id", "synthetic", "--expected-sha256", pairFingerprint(nextCert), "--target-sha256", pairFingerprint(cert)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := invoke(nil, "rollback", "--profile-id", "synthetic", "--expected-sha256", pairFingerprint(nextCert), "--target-sha256", pairFingerprint(cert)); err != nil {
++		t.Fatal("rollback retry was not idempotent")
++	}
++	originalBlock, _ := pem.Decode(cert)
++	deadline = time.Now().Add(8 * time.Second)
++	for {
++		conn := connect()
++		got := conn.ConnectionState().PeerCertificates[0].Raw
++		conn.Close()
++		if bytes.Equal(got, originalBlock.Bytes) {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("rollback did not restore actual TLS certificate")
++		}
++		time.Sleep(200 * time.Millisecond)
++	}
++}
+diff --git a/cmd/origin_ca.go b/cmd/origin_ca.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/origin_ca.go
+@@ -0,0 +1,83 @@
++package cmd
++
++import (
++	"crypto/sha256"
++	"crypto/x509"
++	_ "embed"
++	"encoding/pem"
++	"fmt"
++	"time"
++)
++
++// Public trust anchors downloaded from the official Cloudflare SSL docs. These
++// bytes never enter the system trust store and contain no private key material.
++//
++//go:embed cloudflare_origin_ecc_root.pem
++var cloudflareOriginECC []byte
++
++//go:embed cloudflare_origin_rsa_root.pem
++var cloudflareOriginRSA []byte
++
++var cloudflareOriginPins = map[string]bool{
++	"aa63697a22764b67b2134ce14cb5690ea336940b93986113f49545917832d80d": true,
++	"d3c7e85c91707fc0a12abc5d88266747aa4fa8e7b162f633ffb3c9d989947620": true,
++}
++
++func loadCloudflareOriginRoots() (*x509.CertPool, error) {
++	pool := x509.NewCertPool()
++	for _, data := range [][]byte{cloudflareOriginECC, cloudflareOriginRSA} {
++		block, rest := pem.Decode(data)
++		if block == nil || block.Type != "CERTIFICATE" || len(rest) != 0 {
++			return nil, fmt.Errorf("invalid bundled Origin CA anchor")
++		}
++		cert, err := x509.ParseCertificate(block.Bytes)
++		if err != nil || !cert.IsCA || !cloudflareOriginPins[fmt.Sprintf("%x", sha256.Sum256(cert.Raw))] {
++			return nil, fmt.Errorf("unexpected bundled Origin CA anchor")
++		}
++		if err := cert.CheckSignatureFrom(cert); err != nil {
++			return nil, fmt.Errorf("invalid Origin CA anchor signature")
++		}
++		pool.AddCert(cert)
++	}
++	return pool, nil
++}
++
++// Tests replace this private factory in their isolated subprocess only. The
++// shipping command has no flag or environment option for changing its anchors.
++var cloudflareOriginRoots = loadCloudflareOriginRoots
++
++func profileTrustMode(profile *hostCertificateProfile) string {
++	if profile.TrustMode == "" {
++		return "public_ca"
++	}
++	return profile.TrustMode
++}
++
++func validateHostTrustPolicy(profile *hostCertificateProfile) error {
++	mode := profileTrustMode(profile)
++	if mode != "public_ca" && mode != "cloudflare_origin_ca" {
++		return fmt.Errorf("unsupported certificate trust mode")
++	}
++	if profile.ClientRoute != "" && profile.ClientRoute != "cdn_only" && profile.ClientRoute != "dns_split" {
++		return fmt.Errorf("unsupported certificate client route")
++	}
++	if mode == "cloudflare_origin_ca" && profile.ClientRoute != "cdn_only" {
++		return fmt.Errorf("Origin CA requires an approved CDN-only profile; direct DNS routes require public CA")
++	}
++	return nil
++}
++
++func verifyProfileCertificate(profile *hostCertificateProfile, certificate []byte) (time.Time, error) {
++	if err := validateHostTrustPolicy(profile); err != nil {
++		return time.Time{}, err
++	}
++	var roots *x509.CertPool
++	if profileTrustMode(profile) == "cloudflare_origin_ca" {
++		var err error
++		roots, err = cloudflareOriginRoots()
++		if err != nil {
++			return time.Time{}, err
++		}
++	}
++	return verifyIssuedChainExpiry(certificate, profile.Domain, roots, profileTrustMode(profile) == "public_ca")
++}
+diff --git a/cmd/origin_ca_test.go b/cmd/origin_ca_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/origin_ca_test.go
+@@ -0,0 +1,253 @@
++//go:build linux
++
++package cmd
++
++import (
++	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/sha256"
++	ctls "crypto/tls"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/json"
++	"encoding/pem"
++	"fmt"
++	"math/big"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/platform/filesystem"
++)
++
++type originTestCA struct {
++	root *x509.Certificate
++	key  *ecdsa.PrivateKey
++	pem  []byte
++}
++
++func makeOriginTestCA(t *testing.T) originTestCA {
++	t.Helper()
++	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	template := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "synthetic scoped origin CA"}, IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(120 * 24 * time.Hour)}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	root, err := x509.ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return originTestCA{root, key, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
++}
++func (ca originTestCA) sign(t *testing.T, csr []byte) []byte {
++	t.Helper()
++	block, _ := pem.Decode(csr)
++	request, err := x509.ParseCertificateRequest(block.Bytes)
++	if err != nil || request.CheckSignature() != nil {
++		t.Fatal("invalid synthetic CSR")
++	}
++	leaf := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), DNSNames: request.DNSNames, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().AddDate(5, 0, 0), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, KeyUsage: x509.KeyUsageDigitalSignature}
++	der, err := x509.CreateCertificate(rand.Reader, leaf, ca.root, request.PublicKey, ca.key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), ca.pem...)
++}
++
++func TestBundledCloudflareOriginAnchorsArePinned(t *testing.T) {
++	pool, err := loadCloudflareOriginRoots()
++	if err != nil || pool == nil {
++		t.Fatalf("official anchors: %v", err)
++	}
++	for _, data := range [][]byte{cloudflareOriginECC, cloudflareOriginRSA} {
++		block, _ := pem.Decode(data)
++		cert, _ := x509.ParseCertificate(block.Bytes)
++		if cert.NotAfter.Year() != 2029 || !cloudflareOriginPins[fmt.Sprintf("%x", sha256.Sum256(cert.Raw))] {
++			t.Fatal("unexpected official anchor metadata")
++		}
++	}
++}
++
++func TestOriginTrustPolicyAndEffectiveChainExpiry(t *testing.T) {
++	ca := makeOriginTestCA(t)
++	other := makeOriginTestCA(t)
++	dir := t.TempDir()
++	csr, err := createHostCSR("node.example.invalid", filepath.Join(dir, "key"), "synthetic_job_01")
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert := ca.sign(t, csr)
++	pool := x509.NewCertPool()
++	pool.AppendCertsFromPEM(ca.pem)
++	end, err := verifyIssuedChainExpiry(cert, "node.example.invalid", pool, false)
++	if err != nil || !end.Equal(ca.root.NotAfter) {
++		t.Fatalf("long leaf ignored root expiry: %v", err)
++	}
++	if err := verifyIssuedChain(other.sign(t, csr), "node.example.invalid", pool); err == nil {
++		t.Fatal("unrelated response root self-trusted")
++	}
++	profile := &hostCertificateProfile{Domain: "node.example.invalid", TrustMode: "cloudflare_origin_ca", ClientRoute: "dns_split"}
++	if err := validateHostTrustPolicy(profile); err == nil {
++		t.Fatal("Origin CA enabled for direct DNS route")
++	}
++	profile.ClientRoute = "cdn_only"
++	if err := validateHostTrustPolicy(profile); err != nil {
++		t.Fatal(err)
++	}
++	// Model an Origin anchor already added to an OS store: public policy must
++	// still exclude that anchor rather than inherit its trust accidentally.
++	pin := fmt.Sprintf("%x", sha256.Sum256(ca.root.Raw))
++	cloudflareOriginPins[pin] = true
++	defer delete(cloudflareOriginPins, pin)
++	if _, err := verifyIssuedChainExpiry(cert, "node.example.invalid", pool, true); err == nil {
++		t.Fatal("public policy trusted an Origin CA anchor")
++	}
++}
++
++func TestAutomaticProfileInitializationAndOriginCLI(t *testing.T) {
++	dir := t.TempDir()
++	profiles := filepath.Join(dir, "profiles")
++	managed := filepath.Join(dir, "managed")
++	ca := makeOriginTestCA(t)
++	anchor := filepath.Join(dir, "origin-root.pem")
++	os.WriteFile(anchor, ca.pem, 0600)
++	executable, _ := os.Executable()
++	invoke := func(input []byte, args ...string) ([]byte, error) {
++		child := exec.Command(executable, append([]string{"-test.run=^TestCertificateCLIProcess$", "--", "certificate"}, args...)...)
++		child.Env = append(os.Environ(), "NODEPULSE_CERT_CLI_TEST_CHILD=1", "NODEPULSE_CERT_CLI_TEST_PROFILE_ROOT="+profiles, "NODEPULSE_CERT_CLI_TEST_MANAGED_ROOT="+managed, "NODEPULSE_CERT_CLI_TEST_ORIGIN_CA="+anchor, "SSL_CERT_FILE="+filepath.Join(dir, "no-public-roots"), "SSL_CERT_DIR="+filepath.Join(dir, "no-public-root-dir"))
++		child.Stdin = bytes.NewReader(input)
++		var out, diagnostic bytes.Buffer
++		child.Stdout = &out
++		child.Stderr = &diagnostic
++		err := child.Run()
++		if err != nil {
++			return out.Bytes(), fmt.Errorf("%w: %s", err, diagnostic.String())
++		}
++		return out.Bytes(), nil
++	}
++	profile := hostCertificateProfile{ID: "cf-origin", Domain: "node.example.invalid", CertFile: filepath.Join(managed, "vless1793359066000.cer"), KeyFile: filepath.Join(managed, "vless1793359066000.key"), TrustMode: "cloudflare_origin_ca", ClientRoute: "cdn_only"}
++	data, _ := json.Marshal(profile)
++	bad := profile
++	bad.ID = "cf-direct"
++	bad.ClientRoute = "dns_split"
++	badData, _ := json.Marshal(bad)
++	if _, err := invoke(badData, "profile-init", "--profile-id", bad.ID, "--node-id", "1793359066000"); err == nil {
++		t.Fatal("initialized Origin CA direct route")
++	}
++	if _, err := os.Stat(profiles); !os.IsNotExist(err) {
++		t.Fatal("invalid profile created files")
++	}
++	if _, err := invoke(data, "profile-init", "--profile-id", profile.ID, "--node-id", "1793359066000"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := invoke(data, "profile-init", "--profile-id", profile.ID, "--node-id", "1793359066000"); err != nil {
++		t.Fatal("profile initialization retry failed")
++	}
++	bad = profile
++	bad.Domain = "changed.example.invalid"
++	badData, _ = json.Marshal(bad)
++	if _, err := invoke(badData, "profile-init", "--profile-id", profile.ID, "--node-id", "1793359066000"); err == nil {
++		t.Fatal("changed an immutable profile")
++	}
++	csr, err := invoke(nil, "csr", "--profile-id", profile.ID, "--request-id", "origin_job_001")
++	if err != nil {
++		t.Fatal(err)
++	}
++	certificate := ca.sign(t, csr)
++	out, err := invoke(certificate, "install", "--profile-id", profile.ID, "--request-id", "origin_job_001")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var receipt map[string]any
++	if err := json.Unmarshal(out, &receipt); err != nil {
++		t.Fatal(err)
++	}
++	effective, err := time.Parse(time.RFC3339, receipt["effective_not_after"].(string))
++	if err != nil || !effective.Equal(ca.root.NotAfter) {
++		t.Fatal("CLI did not report the trust-chain expiry")
++	}
++	recovered, err := invoke(nil, "csr", "--profile-id", profile.ID, "--request-id", "origin_job_001")
++	if err != nil || !bytes.Equal(recovered, csr) {
++		t.Fatal("installed CSR was not recovered after lost receipt")
++	}
++	cert, key, err := filesystem.ReadCertificatePair(profile.CertFile, profile.KeyFile)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pair, err := ctls.X509KeyPair(cert, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	listener, err := ctls.Listen("tcp", "127.0.0.1:0", &ctls.Config{Certificates: []ctls.Certificate{pair}, NextProtos: []string{"h2"}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func(conn net.Conn) {
++				defer conn.Close()
++				conn.SetDeadline(time.Now().Add(2 * time.Second))
++				conn.(*ctls.Conn).Handshake()
++			}(conn)
++		}
++	}()
++	pool := x509.NewCertPool()
++	pool.AppendCertsFromPEM(ca.pem)
++	connection, err := ctls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", listener.Addr().String(), &ctls.Config{ServerName: profile.Domain, RootCAs: pool, NextProtos: []string{"h2"}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if connection.ConnectionState().NegotiatedProtocol != "h2" {
++		t.Fatal("Origin H2 was not negotiated")
++	}
++	connection.Close()
++	if conn, err := ctls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", listener.Addr().String(), &ctls.Config{ServerName: profile.Domain, RootCAs: x509.NewCertPool()}); err == nil {
++		conn.Close()
++		t.Fatal("ordinary direct trust accepted the scoped Origin certificate")
++	}
++	public := profile
++	public.ID = "public-direct"
++	public.TrustMode = "public_ca"
++	public.ClientRoute = "dns_split"
++	public.CertFile = filepath.Join(managed, "vless901.cer")
++	public.KeyFile = filepath.Join(managed, "vless901.key")
++	publicData, _ := json.Marshal(public)
++	if _, err := invoke(publicData, "profile-init", "--profile-id", public.ID, "--node-id", "901"); err != nil {
++		t.Fatal(err)
++	}
++	publicCSR, err := invoke(nil, "csr", "--profile-id", public.ID, "--request-id", "public_job_001")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := invoke(ca.sign(t, publicCSR), "install", "--profile-id", public.ID, "--request-id", "public_job_001"); err == nil {
++		t.Fatal("public/direct profile installed a scoped CA certificate")
++	}
++}
++
++func TestManagedNodeIDsMatchJavaScriptSafeIntegers(t *testing.T) {
++	dir := t.TempDir()
++	managed := filepath.Join(dir, "managed")
++	old := hostCertificateManagedRoot
++	hostCertificateManagedRoot = managed
++	defer func() { hostCertificateManagedRoot = old }()
++	for _, nodeID := range []int64{1793359066000, 9007199254740991, 9007199254740992} {
++		id := fmt.Sprintf("node-%d", nodeID)
++		profile := hostCertificateProfile{ID: id, Domain: "node.example.invalid", CertFile: filepath.Join(managed, fmt.Sprintf("vless%d.cer", nodeID)), KeyFile: filepath.Join(managed, fmt.Sprintf("vless%d.key", nodeID))}
++		raw, _ := json.Marshal(profile)
++		_, _, err := initializeHostCertificateProfile(filepath.Join(dir, "profiles"), id, nodeID, raw)
++		if (err == nil) != (nodeID <= 9007199254740991) {
++			t.Fatalf("unexpected node ID bound: %d", nodeID)
++		}
++	}
++}
+diff --git a/cmd/cloudflare_origin_ecc_root.pem b/cmd/cloudflare_origin_ecc_root.pem
+new file mode 100644
+--- /dev/null
++++ b/cmd/cloudflare_origin_ecc_root.pem
+@@ -0,0 +1,16 @@
++-----BEGIN CERTIFICATE-----
++MIICiTCCAi6gAwIBAgIUXZP3MWb8MKwBE1Qbawsp1sfA/Y4wCgYIKoZIzj0EAwIw
++gY8xCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1T
++YW4gRnJhbmNpc2NvMRkwFwYDVQQKExBDbG91ZEZsYXJlLCBJbmMuMTgwNgYDVQQL
++Ey9DbG91ZEZsYXJlIE9yaWdpbiBTU0wgRUNDIENlcnRpZmljYXRlIEF1dGhvcml0
++eTAeFw0xOTA4MjMyMTA4MDBaFw0yOTA4MTUxNzAwMDBaMIGPMQswCQYDVQQGEwJV
++UzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZyYW5jaXNjbzEZ
++MBcGA1UEChMQQ2xvdWRGbGFyZSwgSW5jLjE4MDYGA1UECxMvQ2xvdWRGbGFyZSBP
++cmlnaW4gU1NMIEVDQyBDZXJ0aWZpY2F0ZSBBdXRob3JpdHkwWTATBgcqhkjOPQIB
++BggqhkjOPQMBBwNCAASR+sGALuaGshnUbcxKry+0LEXZ4NY6JUAtSeA6g87K3jaA
++xpIg9G50PokpfWkhbarLfpcZu0UAoYy2su0EhN7wo2YwZDAOBgNVHQ8BAf8EBAMC
++AQYwEgYDVR0TAQH/BAgwBgEB/wIBAjAdBgNVHQ4EFgQUhTBdOypw1O3VkmcH/es5
++tBoOOKcwHwYDVR0jBBgwFoAUhTBdOypw1O3VkmcH/es5tBoOOKcwCgYIKoZIzj0E
++AwIDSQAwRgIhAKilfntP2ILGZjwajktkBtXE1pB4Y/fjAfLkIRUzrI15AiEA5UCL
++XYZZ9m2c3fKwIenMMojL1eqydsgqj/wK4p5kagQ=
++-----END CERTIFICATE-----
+diff --git a/cmd/cloudflare_origin_rsa_root.pem b/cmd/cloudflare_origin_rsa_root.pem
+new file mode 100644
+--- /dev/null
++++ b/cmd/cloudflare_origin_rsa_root.pem
+@@ -0,0 +1,24 @@
++-----BEGIN CERTIFICATE-----
++MIIEADCCAuigAwIBAgIID+rOSdTGfGcwDQYJKoZIhvcNAQELBQAwgYsxCzAJBgNV
++BAYTAlVTMRkwFwYDVQQKExBDbG91ZEZsYXJlLCBJbmMuMTQwMgYDVQQLEytDbG91
++ZEZsYXJlIE9yaWdpbiBTU0wgQ2VydGlmaWNhdGUgQXV0aG9yaXR5MRYwFAYDVQQH
++Ew1TYW4gRnJhbmNpc2NvMRMwEQYDVQQIEwpDYWxpZm9ybmlhMB4XDTE5MDgyMzIx
++MDgwMFoXDTI5MDgxNTE3MDAwMFowgYsxCzAJBgNVBAYTAlVTMRkwFwYDVQQKExBD
++bG91ZEZsYXJlLCBJbmMuMTQwMgYDVQQLEytDbG91ZEZsYXJlIE9yaWdpbiBTU0wg
++Q2VydGlmaWNhdGUgQXV0aG9yaXR5MRYwFAYDVQQHEw1TYW4gRnJhbmNpc2NvMRMw
++EQYDVQQIEwpDYWxpZm9ybmlhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
++AQEAwEiVZ/UoQpHmFsHvk5isBxRehukP8DG9JhFev3WZtG76WoTthvLJFRKFCHXm
++V6Z5/66Z4S09mgsUuFwvJzMnE6Ej6yIsYNCb9r9QORa8BdhrkNn6kdTly3mdnykb
++OomnwbUfLlExVgNdlP0XoRoeMwbQ4598foiHblO2B/LKuNfJzAMfS7oZe34b+vLB
++yrP/1bgCSLdc1AxQc1AC0EsQQhgcyTJNgnG4va1c7ogPlwKyhbDyZ4e59N5lbYPJ
++SmXI/cAe3jXj1FBLJZkwnoDKe0v13xeF+nF32smSH0qB7aJX2tBMW4TWtFPmzs5I
++lwrFSySWAdwYdgxw180yKU0dvwIDAQABo2YwZDAOBgNVHQ8BAf8EBAMCAQYwEgYD
++VR0TAQH/BAgwBgEB/wIBAjAdBgNVHQ4EFgQUJOhTV118NECHqeuU27rhFnj8KaQw
++HwYDVR0jBBgwFoAUJOhTV118NECHqeuU27rhFnj8KaQwDQYJKoZIhvcNAQELBQAD
++ggEBAHwOf9Ur1l0Ar5vFE6PNrZWrDfQIMyEfdgSKofCdTckbqXNTiXdgbHs+TWoQ
++wAB0pfJDAHJDXOTCWRyTeXOseeOi5Btj5CnEuw3P0oXqdqevM1/+uWp0CM35zgZ8
++VD4aITxity0djzE6Qnx3Syzz+ZkoBgTnNum7d9A66/V636x4vTeqbZFBr9erJzgz
++hhurjcoacvRNhnjtDRM0dPeiCJ50CP3wEYuvUzDHUaowOsnLCjQIkWbR7Ni6KEIk
++MOz2U0OBSif3FTkhCgZWQKOOLo1P42jHC3ssUZAtVNXrCk3fw9/E15k8NPkBazZ6
++0iykLhH1trywrKRMVw67F44IE8Y=
++-----END CERTIFICATE-----

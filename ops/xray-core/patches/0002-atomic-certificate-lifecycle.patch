@@ -1,0 +1,1281 @@
+diff --git a/common/platform/filesystem/cert_pair.go b/common/platform/filesystem/cert_pair.go
+new file mode 100644
+--- /dev/null
++++ b/common/platform/filesystem/cert_pair.go
+@@ -0,0 +1,300 @@
++package filesystem
++
++// NodePulse stores a complete PEM pair in the private key file. A single rename
++// publishes that pair; the public certificate file is a certificate-only mirror.
++// Readers of managed pairs must read the key file once, rather than combining
++// two independently changing files. Legacy separate PEM files remain readable.
++
++import (
++	"bytes"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/pem"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"time"
++)
++
++const maxCertificateFile = 4 << 20
++
++func certificatePEM(data []byte) []byte {
++	var result []byte
++	for len(data) > 0 {
++		block, rest := pem.Decode(data)
++		if block == nil {
++			break
++		}
++		if block.Type == "CERTIFICATE" {
++			result = append(result, pem.EncodeToMemory(block)...)
++		}
++		data = rest
++	}
++	return result
++}
++
++func ReadCertificatePair(certPath, keyPath string) ([]byte, []byte, error) {
++	key, err := ReadPrivateFile(keyPath)
++	if err != nil {
++		return nil, nil, err
++	}
++	cert := certificatePEM(key)
++	if len(cert) == 0 {
++		cert, err = ReadCert(certPath)
++		if err != nil {
++			return nil, nil, err
++		}
++	}
++	if _, err = tls.X509KeyPair(cert, key); err != nil {
++		return nil, nil, errors.New("certificate and private key do not form a valid pair")
++	}
++	return cert, key, nil
++}
++
++// ValidateCertificatePair checks the intended name, validity period and key pair.
++// It does not establish a public trust chain; that is an issuer/deployment check.
++func ValidateCertificatePair(cert, key []byte, domain string, now time.Time) error {
++	pair, err := tls.X509KeyPair(cert, key)
++	if err != nil {
++		return errors.New("invalid certificate and private key pair")
++	}
++	leaf, err := x509.ParseCertificate(pair.Certificate[0])
++	if err != nil {
++		return errors.New("invalid leaf certificate")
++	}
++	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
++		return errors.New("certificate is not currently valid")
++	}
++	if domain != "" {
++		if err := leaf.VerifyHostname(domain); err != nil {
++			return errors.New("certificate does not cover the intended name")
++		}
++	}
++	return nil
++}
++
++func safeParent(name string) error {
++	if !filepath.IsAbs(name) {
++		return errors.New("certificate paths must be absolute")
++	}
++	parent := filepath.Dir(filepath.Clean(name))
++	// Check every existing ancestor before creating anything beneath it.
++	for existing := parent; ; existing = filepath.Dir(existing) {
++		if _, err := os.Lstat(existing); err == nil {
++			if err := checkCertificateParents(existing); err != nil {
++				return err
++			}
++			break
++		} else if !os.IsNotExist(err) {
++			return err
++		}
++	}
++	if err := os.MkdirAll(parent, 0700); err != nil {
++		return err
++	}
++	return checkCertificateParents(parent)
++}
++
++func EnsurePrivateDirectory(name string) error {
++	if err := safeParent(filepath.Join(name, "state")); err != nil {
++		return err
++	}
++	return restrictCertificateDirectory(name)
++}
++
++func WithPrivateFileLock(name string, execute func() error) error {
++	if err := safeParent(name); err != nil {
++		return err
++	}
++	return withCertificateLock(name, execute)
++}
++
++func atomicCertificateFile(name string, data []byte, mode os.FileMode) (published bool, err error) {
++	if err = safeParent(name); err != nil {
++		return false, err
++	}
++	if info, statErr := os.Lstat(name); statErr == nil {
++		if err = checkCertificateOwner(info); err != nil {
++			return false, err
++		}
++	} else if !os.IsNotExist(statErr) {
++		return false, statErr
++	}
++	f, err := os.CreateTemp(filepath.Dir(name), ".nodepulse-cert-*")
++	if err != nil {
++		return false, err
++	}
++	defer os.Remove(f.Name())
++	defer f.Close()
++	if err = f.Chmod(mode); err != nil {
++		return false, err
++	}
++	if _, err = f.Write(data); err != nil {
++		return false, err
++	}
++	if err = f.Sync(); err != nil {
++		return false, err
++	}
++	if err = f.Close(); err != nil {
++		return false, err
++	}
++	dir, err := os.Open(filepath.Dir(name))
++	if err != nil {
++		return false, err
++	}
++	defer dir.Close()
++	// Check durability support before the commit point.
++	if err = dir.Sync(); err != nil {
++		return false, err
++	}
++	if err = os.Rename(f.Name(), name); err != nil {
++		return false, err
++	}
++	return true, dir.Sync()
++}
++
++// WritePrivateFile creates or replaces an owner-only file without truncating an
++// existing key/account file on an encoding or write failure.
++func WritePrivateFile(name string, data []byte) error {
++	if len(data) > maxCertificateFile {
++		return errors.New("private file is too large")
++	}
++	_, err := atomicCertificateFile(name, data, 0600)
++	return err
++}
++
++func ReadPrivateFile(name string) ([]byte, error) {
++	return readPrivateFile(name, true)
++}
++
++// ReadPrivateFileStrict performs no permission changes; approved host profiles
++// must already have owner-only permissions before a read-only preflight.
++func ReadPrivateFileStrict(name string) ([]byte, error) { return readPrivateFile(name, false) }
++
++func readPrivateFile(name string, harden bool) ([]byte, error) {
++	if !filepath.IsAbs(name) {
++		return nil, errors.New("certificate paths must be absolute")
++	}
++	if err := checkCertificateParents(filepath.Dir(name)); err != nil {
++		return nil, err
++	}
++	f, err := openCertificatePrivateFile(name)
++	if err != nil {
++		return nil, err
++	}
++	defer f.Close()
++	info, err := f.Stat()
++	if err != nil {
++		return nil, err
++	}
++	if err := checkCertificateOwner(info); err != nil {
++		return nil, err
++	}
++	if info.Mode().Perm() != 0600 {
++		if !harden {
++			return nil, errors.New("approved private file must already have mode 0600")
++		}
++		if err := f.Chmod(0600); err != nil {
++			return nil, fmt.Errorf("cannot restrict private file for runtime uid %d: %w", os.Geteuid(), err)
++		}
++	}
++	data, err := io.ReadAll(io.LimitReader(f, maxCertificateFile+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(data) > maxCertificateFile {
++		return nil, errors.New("private file is too large")
++	}
++	return data, nil
++}
++
++// WriteCertificatePair keeps the previous authoritative pair on pre-commit
++// failure. The last successful pair is also retained in keyPath.previous (0600).
++// A post-rename directory-sync error is explicitly identified as published;
++// callers must check the active fingerprint rather than assume a rollback.
++func WriteCertificatePair(certPath, keyPath string, cert, key []byte, domain string) error {
++	return writeCertificatePair(certPath, keyPath, cert, key, domain, nil)
++}
++
++func writeCertificatePair(certPath, keyPath string, cert, key []byte, domain string, beforeCommit func() error) error {
++	if filepath.Clean(certPath) == filepath.Clean(keyPath) {
++		return errors.New("certificate and key paths must differ")
++	}
++	if err := ValidateCertificatePair(cert, key, domain, time.Now()); err != nil {
++		return err
++	}
++	cert = certificatePEM(cert)
++	if len(cert)+len(key) > maxCertificateFile {
++		return errors.New("certificate pair is too large")
++	}
++	if err := safeParent(keyPath); err != nil {
++		return err
++	}
++	return withCertificateLock(keyPath+".lock", func() error {
++		var oldCert, oldKey []byte
++		if _, err := os.Lstat(keyPath); err == nil {
++			var readErr error
++			oldCert, oldKey, readErr = ReadCertificatePair(certPath, keyPath)
++			if readErr != nil {
++				return readErr
++			}
++			// Bootstrap old separate files into a complete private PEM before
++			// replacing the public mirror. A crash can then expose only a valid
++			// old or new pair to the paired reader.
++			oldBundle := append(append([]byte{}, oldCert...), '\n')
++			oldBundle = append(oldBundle, privateKeyPEM(oldKey)...)
++			if _, err := atomicCertificateFile(keyPath, oldBundle, 0600); err != nil {
++				return err
++			}
++			if err := WritePrivateFile(keyPath+".previous", oldBundle); err != nil {
++				return err
++			}
++		} else if !os.IsNotExist(err) {
++			return err
++		}
++		if _, err := atomicCertificateFile(certPath, cert, 0644); err != nil {
++			return err
++		}
++		rollbackMirror := func() {
++			if oldCert != nil {
++				_, _ = atomicCertificateFile(certPath, oldCert, 0644)
++			} else {
++				_ = os.Remove(certPath)
++			}
++		}
++		if beforeCommit != nil {
++			if err := beforeCommit(); err != nil {
++				rollbackMirror()
++				return err
++			}
++		}
++		bundle := append(append([]byte{}, cert...), '\n')
++		bundle = append(bundle, privateKeyPEM(key)...)
++		published, err := atomicCertificateFile(keyPath, bundle, 0600)
++		if err != nil {
++			if !published {
++				rollbackMirror()
++				return err
++			}
++			return fmt.Errorf("certificate pair published but directory durability confirmation failed: %w", err)
++		}
++		return nil
++	})
++}
++
++func privateKeyPEM(data []byte) []byte {
++	var result []byte
++	for len(data) > 0 {
++		block, rest := pem.Decode(data)
++		if block == nil {
++			break
++		}
++		if bytes.HasSuffix([]byte(block.Type), []byte("PRIVATE KEY")) {
++			result = append(result, pem.EncodeToMemory(block)...)
++		}
++		data = rest
++	}
++	return result
++}
+diff --git a/common/platform/filesystem/cert_owner_linux.go b/common/platform/filesystem/cert_owner_linux.go
+new file mode 100644
+--- /dev/null
++++ b/common/platform/filesystem/cert_owner_linux.go
+@@ -0,0 +1,85 @@
++//go:build linux
++
++package filesystem
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"syscall"
++)
++
++func checkCertificateOwner(info os.FileInfo) error {
++	s, ok := info.Sys().(*syscall.Stat_t)
++	// A reader may hold the previous inode after an atomic rename (Nlink=0).
++	// It is still private and immutable to other users; hard links are rejected.
++	if !ok || !info.Mode().IsRegular() || int(s.Uid) != os.Geteuid() || s.Nlink > 1 {
++		return errors.New("private certificate files must be regular, singly linked and owned by the runtime uid")
++	}
++	return nil
++}
++
++func checkCertificateParents(name string) error {
++	for {
++		info, err := os.Lstat(name)
++		if err != nil {
++			return err
++		}
++		s, ok := info.Sys().(*syscall.Stat_t)
++		if !ok || !info.IsDir() || (s.Uid != 0 && int(s.Uid) != os.Geteuid()) {
++			return errors.New("certificate parent must be a real directory owned by root or runtime uid")
++		}
++		if info.Mode().Perm()&0022 != 0 && info.Mode()&os.ModeSticky == 0 {
++			return errors.New("certificate parent is writable by another user")
++		}
++		parent := filepath.Dir(name)
++		if parent == name {
++			return nil
++		}
++		name = parent
++	}
++}
++
++func openCertificatePrivateFile(name string) (*os.File, error) {
++	fd, err := syscall.Open(name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, err
++	}
++	return os.NewFile(uintptr(fd), name), nil
++}
++
++func restrictCertificateDirectory(name string) error {
++	info, err := os.Lstat(name)
++	if err != nil {
++		return err
++	}
++	s, ok := info.Sys().(*syscall.Stat_t)
++	if !ok || !info.IsDir() || int(s.Uid) != os.Geteuid() {
++		return errors.New("private account directory must be owned by runtime uid")
++	}
++	return os.Chmod(name, 0700)
++}
++
++func withCertificateLock(name string, execute func() error) error {
++	fd, err := syscall.Open(name, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
++	if err != nil {
++		return err
++	}
++	f := os.NewFile(uintptr(fd), name)
++	defer f.Close()
++	info, err := f.Stat()
++	if err != nil {
++		return err
++	}
++	if err = checkCertificateOwner(info); err != nil {
++		return err
++	}
++	if err = f.Chmod(0600); err != nil {
++		return err
++	}
++	if err = syscall.Flock(fd, syscall.LOCK_EX); err != nil {
++		return err
++	}
++	defer syscall.Flock(fd, syscall.LOCK_UN)
++	return execute()
++}
+diff --git a/common/platform/filesystem/cert_owner_other.go b/common/platform/filesystem/cert_owner_other.go
+new file mode 100644
+--- /dev/null
++++ b/common/platform/filesystem/cert_owner_other.go
+@@ -0,0 +1,25 @@
++//go:build !linux
++
++package filesystem
++
++import (
++	"errors"
++	"os"
++)
++
++func restrictCertificateDirectory(string) error {
++	return errors.New("managed certificate store requires Linux ownership enforcement")
++}
++
++func checkCertificateOwner(os.FileInfo) error {
++	return errors.New("managed certificate store requires Linux ownership enforcement")
++}
++func checkCertificateParents(string) error {
++	return errors.New("managed certificate store requires Linux ownership enforcement")
++}
++func openCertificatePrivateFile(string) (*os.File, error) {
++	return nil, errors.New("managed certificate store requires Linux ownership enforcement")
++}
++func withCertificateLock(string, func() error) error {
++	return errors.New("managed certificate store requires Linux ownership enforcement")
++}
+diff --git a/common/platform/filesystem/cert_pair_test.go b/common/platform/filesystem/cert_pair_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/platform/filesystem/cert_pair_test.go
+@@ -0,0 +1,313 @@
++//go:build linux
++
++package filesystem
++
++import (
++	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"errors"
++	"math/big"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestStoreRejectsRootRealUIDWithDroppedEffectiveUID(t *testing.T) {
++	if os.Getenv("NODEPULSE_CERT_EUID_CHILD") == "1" {
++		if err := syscall.Setresuid(0, 65534, 65534); err != nil {
++			t.Fatal(err)
++		}
++		if os.Getuid() != 0 || os.Geteuid() != 65534 {
++			t.Fatal("failed to create controlled real/effective uid difference")
++		}
++		status, err := os.ReadFile("/proc/self/status")
++		if err != nil {
++			t.Fatal(err)
++		}
++		found := false
++		for _, line := range strings.Split(string(status), "\n") {
++			if strings.HasPrefix(line, "Uid:") {
++				ids := strings.Fields(line)
++				found = len(ids) == 5 && ids[1] == "0" && ids[2] == "65534" && ids[4] == "65534"
++			}
++		}
++		if !found {
++			t.Fatal("proc uid layout did not demonstrate the real/effective difference")
++		}
++		if _, err := ReadPrivateFile(os.Getenv("NODEPULSE_CERT_EUID_ROOT_KEY")); err == nil {
++			t.Fatal("dropped effective uid read a root-only key")
++		}
++		return
++	}
++	if os.Geteuid() != 0 {
++		t.Skip("root launcher needed for controlled effective uid drop")
++	}
++	dir := t.TempDir()
++	os.Chmod(dir, 0755)
++	os.Chmod(filepath.Dir(dir), 0755)
++	key := filepath.Join(dir, "root-key")
++	os.WriteFile(key, []byte("synthetic"), 0600)
++	executable, _ := os.Executable()
++	command := exec.Command(executable, "-test.run=^TestStoreRejectsRootRealUIDWithDroppedEffectiveUID$", "-test.v")
++	command.Env = append(os.Environ(), "NODEPULSE_CERT_EUID_CHILD=1", "NODEPULSE_CERT_EUID_ROOT_KEY="+key)
++	if out, err := command.CombinedOutput(); err != nil {
++		t.Fatalf("effective uid negative check: %v: %s", err, out)
++	}
++}
++
++func TestStoreRuntimeUID(t *testing.T) {
++	if os.Getenv("NODEPULSE_CERT_UID_CHILD") == "1" {
++		dir := os.Getenv("NODEPULSE_CERT_UID_DIR")
++		if os.Geteuid() != 65534 {
++			t.Fatal("child uid was not changed")
++		}
++		if _, err := ReadPrivateFile(filepath.Join(filepath.Dir(dir), "root-owned")); err == nil {
++			t.Fatal("read another runtime identity's key")
++		}
++		cert, key := testPair(t, "node.example.invalid", time.Now().Add(90*24*time.Hour))
++		if err := WriteCertificatePair(filepath.Join(dir, "cert"), filepath.Join(dir, "key"), cert, key, "node.example.invalid"); err != nil {
++			t.Fatal(err)
++		}
++		assertMode(t, filepath.Join(dir, "key"), 0600)
++		return
++	}
++	if os.Geteuid() != 0 {
++		t.Skip("root launcher needed for controlled runtime uid switch")
++	}
++	dir := t.TempDir()
++	os.Chmod(dir, 0755)
++	os.Chmod(filepath.Dir(dir), 0755)
++	child := filepath.Join(dir, "child")
++	os.Mkdir(child, 0700)
++	os.Chown(child, 65534, 65534)
++	os.WriteFile(filepath.Join(dir, "root-owned"), []byte("synthetic"), 0644)
++	executable, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	command := exec.Command(executable, "-test.run=^TestStoreRuntimeUID$", "-test.v")
++	command.Env = append(os.Environ(), "NODEPULSE_CERT_UID_CHILD=1", "NODEPULSE_CERT_UID_DIR="+child)
++	command.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
++	if out, err := command.CombinedOutput(); err != nil {
++		t.Fatalf("runtime uid check: %v: %s", err, out)
++	}
++}
++
++func testPair(t *testing.T, name string, end time.Time) ([]byte, []byte) {
++	t.Helper()
++	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
++	c := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: name}, DNSNames: []string{name}, NotBefore: time.Now().Add(-time.Hour), NotAfter: end, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
++	der, err := x509.CreateCertificate(rand.Reader, c, c, k.Public(), k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pk, _ := x509.MarshalECPrivateKey(k)
++	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: pk})
++}
++
++func assertMode(t *testing.T, p string, want os.FileMode) {
++	t.Helper()
++	info, err := os.Stat(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != want {
++		t.Fatalf("mode %o, want %o", info.Mode().Perm(), want)
++	}
++}
++
++func TestManagedPairAtomicRenewalAndPermissions(t *testing.T) {
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
++	a, ak := testPair(t, "node.example.invalid", time.Now().Add(90*24*time.Hour))
++	if err := WriteCertificatePair(cp, kp, a, ak, "node.example.invalid"); err != nil {
++		t.Fatal(err)
++	}
++	assertMode(t, kp, 0600)
++	assertMode(t, cp, 0644)
++	public, _ := os.ReadFile(cp)
++	if bytes.Contains(public, []byte("PRIVATE KEY")) {
++		t.Fatal("public mirror contains a key")
++	}
++	b, bk := testPair(t, "node.example.invalid", time.Now().Add(100*24*time.Hour))
++	if err := WriteCertificatePair(cp, kp, b, bk, "node.example.invalid"); err != nil {
++		t.Fatal(err)
++	}
++	got, _, err := ReadCertificatePair(cp, kp)
++	if err != nil || !bytes.Equal(got, b) {
++		t.Fatalf("new pair not active: %v", err)
++	}
++	old, err := ReadPrivateFile(kp + ".previous")
++	if err != nil || !bytes.Equal(certificatePEM(old), a) {
++		t.Fatal("previous pair missing")
++	}
++	assertMode(t, kp+".previous", 0600)
++	// The authority is one private PEM; a missing public mirror cannot break it.
++	if err := os.Remove(cp); err != nil {
++		t.Fatal(err)
++	}
++	if got, _, err = ReadCertificatePair(cp, kp); err != nil || !bytes.Equal(got, b) {
++		t.Fatal("pair did not survive mirror loss")
++	}
++}
++
++func TestLegacyPairMigrationAndPreCommitFailure(t *testing.T) {
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert"), filepath.Join(dir, "key")
++	a, ak := testPair(t, "node.example.invalid", time.Now().Add(90*24*time.Hour))
++	if err := os.WriteFile(cp, a, 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(kp, ak, 0644); err != nil {
++		t.Fatal(err)
++	}
++	b, bk := testPair(t, "node.example.invalid", time.Now().Add(100*24*time.Hour))
++	err := writeCertificatePair(cp, kp, b, bk, "node.example.invalid", func() error { return errors.New("simulated interrupted deployment") })
++	if err == nil {
++		t.Fatal("expected failure")
++	}
++	got, _, err := ReadCertificatePair(cp, kp)
++	if err != nil || !bytes.Equal(got, a) {
++		t.Fatal("old pair lost after failure")
++	}
++	assertMode(t, kp, 0600)
++	public, _ := os.ReadFile(cp)
++	if !bytes.Equal(public, a) {
++		t.Fatal("public mirror not restored")
++	}
++}
++
++func TestInvalidCandidatesDoNotReplaceOldPair(t *testing.T) {
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert"), filepath.Join(dir, "key")
++	a, ak := testPair(t, "node.example.invalid", time.Now().Add(90*24*time.Hour))
++	if err := WriteCertificatePair(cp, kp, a, ak, "node.example.invalid"); err != nil {
++		t.Fatal(err)
++	}
++	b, bk := testPair(t, "other.example.invalid", time.Now().Add(90*24*time.Hour))
++	expired, ek := testPair(t, "node.example.invalid", time.Now().Add(-time.Minute))
++	for name, pair := range map[string][][]byte{"wrong-SAN": {b, bk}, "wrong-key": {a, bk}, "expired": {expired, ek}, "malformed": {[]byte("bad"), ak}} {
++		t.Run(name, func(t *testing.T) {
++			if err := WriteCertificatePair(cp, kp, pair[0], pair[1], "node.example.invalid"); err == nil {
++				t.Fatal("accepted invalid certificate")
++			}
++			got, _, err := ReadCertificatePair(cp, kp)
++			if err != nil || !bytes.Equal(got, a) {
++				t.Fatal("old pair changed")
++			}
++		})
++	}
++}
++
++func TestPrivateFileLinksAndUntrustedParentsRejected(t *testing.T) {
++	dir := t.TempDir()
++	real := filepath.Join(dir, "real")
++	if err := os.WriteFile(real, []byte("synthetic"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	sym := filepath.Join(dir, "symlink")
++	if err := os.Symlink(real, sym); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := ReadPrivateFile(sym); err == nil {
++		t.Fatal("read symlink")
++	}
++	if err := WritePrivateFile(sym, []byte("new")); err == nil {
++		t.Fatal("replaced symlink")
++	}
++	hard := filepath.Join(dir, "hard")
++	if err := os.Link(real, hard); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := ReadPrivateFile(hard); err == nil {
++		t.Fatal("read hardlink")
++	}
++	bad := filepath.Join(dir, "writable")
++	os.Mkdir(bad, 0777)
++	os.Chmod(bad, 0777)
++	if err := WritePrivateFile(filepath.Join(bad, "key"), []byte("x")); err == nil {
++		t.Fatal("accepted shared writable directory")
++	}
++	parentSym := filepath.Join(dir, "parent-link")
++	os.Symlink(bad, parentSym)
++	if err := WritePrivateFile(filepath.Join(parentSym, "new", "key"), []byte("x")); err == nil {
++		t.Fatal("accepted symlink parent")
++	}
++	if _, err := os.Stat(filepath.Join(bad, "new")); !os.IsNotExist(err) {
++		t.Fatal("created directory before rejecting symlink")
++	}
++}
++
++func TestPrivateAccountFileAndDirectoryPermissions(t *testing.T) {
++	dir := filepath.Join(t.TempDir(), "account")
++	if err := EnsurePrivateDirectory(dir); err != nil {
++		t.Fatal(err)
++	}
++	assertMode(t, dir, 0700)
++	name := filepath.Join(dir, "account.json")
++	if err := os.WriteFile(name, []byte("synthetic-account"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := ReadPrivateFileStrict(name); err == nil {
++		t.Fatal("read-only preflight accepted insecure mode")
++	}
++	assertMode(t, name, 0644)
++	if _, err := ReadPrivateFile(name); err != nil {
++		t.Fatal(err)
++	}
++	assertMode(t, name, 0600)
++	if err := WritePrivateFile(name, []byte("updated-synthetic-account")); err != nil {
++		t.Fatal(err)
++	}
++	assertMode(t, name, 0600)
++}
++
++func TestConcurrentReadersNeverObserveMixedPair(t *testing.T) {
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert"), filepath.Join(dir, "key")
++	a, ak := testPair(t, "node.example.invalid", time.Now().Add(90*24*time.Hour))
++	b, bk := testPair(t, "node.example.invalid", time.Now().Add(100*24*time.Hour))
++	if err := WriteCertificatePair(cp, kp, a, ak, "node.example.invalid"); err != nil {
++		t.Fatal(err)
++	}
++	var wg sync.WaitGroup
++	failures := make(chan error, 1000)
++	wg.Go(func() {
++		for range 30 {
++			if err := WriteCertificatePair(cp, kp, b, bk, "node.example.invalid"); err != nil {
++				failures <- err
++			}
++			if err := WriteCertificatePair(cp, kp, a, ak, "node.example.invalid"); err != nil {
++				failures <- err
++			}
++		}
++	})
++	for range 4 {
++		wg.Go(func() {
++			for range 200 {
++				if _, _, err := ReadCertificatePair(cp, kp); err != nil {
++					failures <- err
++				}
++			}
++		})
++	}
++	wg.Wait()
++	close(failures)
++	for err := range failures {
++		t.Error(err)
++	}
++}
+diff --git a/common/ocsp/ocsp.go b/common/ocsp/ocsp.go
+--- a/common/ocsp/ocsp.go
++++ b/common/ocsp/ocsp.go
+@@ -7,6 +7,7 @@
+ 	"io"
+ 	"net/http"
+ 	"os"
++	"time"
+ 
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/platform/filesystem"
+@@ -49,6 +50,7 @@
+ }
+ 
+ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
++	client := &http.Client{Timeout: 15 * time.Second}
+ 	bundle := new(bytes.Buffer)
+ 	for _, derBytes := range cert {
+ 		err := pem.Encode(bundle, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+@@ -70,17 +72,20 @@
+ 		if len(issuedCert.IssuingCertificateURL) == 0 {
+ 			return nil, errors.New("no issuing certificate URL")
+ 		}
+-		resp, errC := http.Get(issuedCert.IssuingCertificateURL[0])
++		resp, errC := client.Get(issuedCert.IssuingCertificateURL[0])
+ 		if errC != nil {
+ 			return nil, errors.New("no issuing certificate URL")
+ 		}
+ 		defer resp.Body.Close()
+ 
+-		issuerBytes, errC := io.ReadAll(resp.Body)
++		issuerBytes, errC := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
+ 		if errC != nil {
+ 			return nil, errors.New(errC)
+ 		}
+ 
++		if len(issuerBytes) > 4<<20 {
++			return nil, errors.New("issuer response exceeds size limit")
++		}
+ 		issuerCert, errC := x509.ParseCertificate(issuerBytes)
+ 		if errC != nil {
+ 			return nil, errors.New(errC)
+@@ -95,14 +100,17 @@
+ 		return nil, err
+ 	}
+ 	reader := bytes.NewReader(ocspReq)
+-	req, err := http.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
++	req, err := client.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
+ 	if err != nil {
+ 		return nil, errors.New(err)
+ 	}
+ 	defer req.Body.Close()
+-	ocspResBytes, err := io.ReadAll(req.Body)
++	ocspResBytes, err := io.ReadAll(io.LimitReader(req.Body, (4<<20)+1))
+ 	if err != nil {
+ 		return nil, errors.New(err)
++	}
++	if len(ocspResBytes) > 4<<20 {
++		return nil, errors.New("OCSP response exceeds size limit")
+ 	}
+ 	return ocspResBytes, nil
+ }
+diff --git a/infra/conf/transport_security.go b/infra/conf/transport_security.go
+--- a/infra/conf/transport_security.go
++++ b/infra/conf/transport_security.go
+@@ -13,6 +13,7 @@
+ 
+ 	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/platform/filesystem"
+ 	"github.com/xtls/xray-core/transport/internet/reality"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+ 	"google.golang.org/protobuf/proto"
+@@ -260,7 +261,10 @@
+ func (c *TLSCertConfig) Build() (*tls.Certificate, error) {
+ 	certificate := new(tls.Certificate)
+ 
+-	cert, err := readFileOrString(c.CertFile, c.CertStr)
++	cert, err := []byte(nil), error(nil)
++	if c.CertFile == "" || c.KeyFile == "" {
++		cert, err = readFileOrString(c.CertFile, c.CertStr)
++	}
+ 	if err != nil {
+ 		return nil, errors.New("failed to parse certificate").Base(err)
+ 	}
+@@ -268,7 +272,10 @@
+ 	certificate.CertificatePath = c.CertFile
+ 
+ 	if len(c.KeyFile) > 0 || len(c.KeyStr) > 0 {
+-		key, err := readFileOrString(c.KeyFile, c.KeyStr)
++		key, err := []byte(nil), error(nil)
++		if c.CertFile == "" || c.KeyFile == "" {
++			key, err = readFileOrString(c.KeyFile, c.KeyStr)
++		}
+ 		if err != nil {
+ 			return nil, errors.New("failed to parse key").Base(err)
+ 		}
+@@ -276,6 +283,13 @@
+ 		certificate.KeyPath = c.KeyFile
+ 	}
+ 
++	if c.CertFile != "" && c.KeyFile != "" {
++		cert, key, err := filesystem.ReadCertificatePair(c.CertFile, c.KeyFile)
++		if err != nil {
++			return nil, errors.New("failed to load certificate pair").Base(err)
++		}
++		certificate.Certificate, certificate.Key = cert, key
++	}
+ 	switch strings.ToLower(c.Usage) {
+ 	case "encipherment":
+ 		certificate.Usage = tls.Certificate_ENCIPHERMENT
+diff --git a/infra/conf/nodepulse_certificate_test.go b/infra/conf/nodepulse_certificate_test.go
+new file mode 100644
+--- /dev/null
++++ b/infra/conf/nodepulse_certificate_test.go
+@@ -0,0 +1,51 @@
++//go:build linux
++
++package conf
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"encoding/pem"
++	"math/big"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/platform/filesystem"
++)
++
++func TestNodePulseManagedCertificateBuildUsesAuthoritativePair(t *testing.T) {
++	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	template := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"node.example.invalid"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(90 * 24 * time.Hour)}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, k.Public(), k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	private, _ := x509.MarshalECPrivateKey(k)
++	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
++	key := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: private})
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert"), filepath.Join(dir, "key")
++	if err := filesystem.WriteCertificatePair(cp, kp, cert, key, "node.example.invalid"); err != nil {
++		t.Fatal(err)
++	}
++	os.Remove(cp)
++	built, err := (&TLSCertConfig{CertFile: cp, KeyFile: kp}).Build()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := x509.ParseCertificate(der); err != nil || len(built.Certificate) == 0 || len(built.Key) == 0 {
++		t.Fatal("authoritative pair not loaded")
++	}
++	// A legacy mismatched pair must fail before listener creation.
++	other, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	otherDER, _ := x509.MarshalECPrivateKey(other)
++	os.WriteFile(cp, cert, 0644)
++	os.WriteFile(kp, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: otherDER}), 0600)
++	if _, err := (&TLSCertConfig{CertFile: cp, KeyFile: kp}).Build(); err == nil {
++		t.Fatal("mismatched legacy pair accepted")
++	}
++}
+diff --git a/transport/internet/tls/config.go b/transport/internet/tls/config.go
+--- a/transport/internet/tls/config.go
++++ b/transport/internet/tls/config.go
+@@ -8,6 +8,7 @@
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"os"
++	"runtime"
+ 	"slices"
+ 	"strings"
+ 	"sync"
+@@ -19,9 +20,13 @@
+ 	"github.com/xtls/xray-core/common/platform/filesystem"
+ 	"github.com/xtls/xray-core/common/protocol/tls/cert"
+ 	"github.com/xtls/xray-core/transport/internet"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ var globalSessionCache = tls.NewLRUClientSessionCache(128)
++
++// Readers retain immutable certificate pointers for the duration of a handshake.
++var certificateReloadMu sync.RWMutex
+ 
+ // ParseCertificate converts a cert.Certificate to Certificate.
+ func ParseCertificate(c *cert.Certificate) *Certificate {
+@@ -47,11 +52,19 @@
+ 
+ // BuildCertificates builds a list of TLS certificates from proto definition.
+ func (c *Config) BuildCertificates() []*tls.Certificate {
++	return c.buildCertificates(nil)
++}
++
++func (c *Config) buildCertificates(stop <-chan struct{}) []*tls.Certificate {
+ 	certs := make([]*tls.Certificate, 0, len(c.Certificate))
++	var watchers []func()
+ 	for _, entry := range c.Certificate {
+ 		if entry.Usage != Certificate_ENCIPHERMENT {
+ 			continue
+ 		}
++		// A proto config may be reused by more than one TLS listener. Each
++		// watcher owns its candidate state rather than mutating shared input.
++		entry = proto.Clone(entry).(*Certificate)
+ 		getX509KeyPair := func() *tls.Certificate {
+ 			keyPair, err := tls.X509KeyPair(entry.Certificate, entry.Key)
+ 			if err != nil {
+@@ -71,63 +84,110 @@
+ 			continue
+ 		}
+ 		index := len(certs) - 1
+-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+-			cert := certs[index]
+-			if isReloaded {
+-				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
+-					cert = newKeyPair
+-				} else {
+-					return
++		watchers = append(watchers, func() {
++			setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
++				certificateReloadMu.RLock()
++				copyOfCert := *certs[index]
++				certificateReloadMu.RUnlock()
++				cert := &copyOfCert
++				if isReloaded {
++					if newKeyPair := getX509KeyPair(); newKeyPair != nil {
++						cert = newKeyPair
++					} else {
++						return
++					}
+ 				}
+-			}
+-			if isOcspstapling {
+-				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
+-					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
+-				} else if string(newOCSPData) != string(cert.OCSPStaple) {
+-					cert.OCSPStaple = newOCSPData
++				if isOcspstapling {
++					if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
++						errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
++					} else if string(newOCSPData) != string(cert.OCSPStaple) {
++						cert.OCSPStaple = newOCSPData
++					}
+ 				}
+-			}
+-			certs[index] = cert
++				certificateReloadMu.Lock()
++				certs[index] = cert
++				certificateReloadMu.Unlock()
++			}, stop)
+ 		})
+ 	}
++	for _, start := range watchers {
++		start()
++	}
+ 	return certs
+ }
+ 
+-func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
++// reloadCertificatePair validates before changing the candidate entry. Failed
++// reads and mismatched/expired files leave the last working in-memory pair intact.
++func reloadCertificatePair(entry *Certificate) (bool, error) {
++	if entry.CertificatePath == "" || entry.KeyPath == "" {
++		return false, nil
++	}
++	cert, key, err := filesystem.ReadCertificatePair(entry.CertificatePath, entry.KeyPath)
++	if err != nil {
++		return false, err
++	}
++	if err = filesystem.ValidateCertificatePair(cert, key, "", time.Now()); err != nil {
++		return false, err
++	}
++	if bytes.Equal(cert, entry.Certificate) && bytes.Equal(key, entry.Key) {
++		return false, nil
++	}
++	entry.Certificate, entry.Key = cert, key
++	return true, nil
++}
++
++func setupOcspTicker(entry *Certificate, callback func(bool, bool), stops ...<-chan struct{}) <-chan struct{} {
++	var stop <-chan struct{}
++	if len(stops) > 0 {
++		stop = stops[0]
++	}
++	done := make(chan struct{})
++	if entry.OneTimeLoading || (entry.CertificatePath == "" && entry.KeyPath == "" && entry.OcspStapling == 0) {
++		close(done)
++		return done
++	}
+ 	go func() {
+-		if entry.OneTimeLoading {
+-			return
+-		}
+-		var isOcspstapling bool
+-		hotReloadCertInterval := uint64(3600)
+-		if entry.OcspStapling != 0 {
+-			hotReloadCertInterval = entry.OcspStapling
+-			isOcspstapling = true
+-		}
+-		t := time.NewTicker(time.Duration(hotReloadCertInterval) * time.Second)
++		defer close(done)
++		// File reload and OCSP use separate schedules. A transient read failure
++		// must not permanently terminate the watcher or trigger a node restart.
++		ticker := time.NewTicker(5 * time.Second)
++		defer ticker.Stop()
++		nextOCSP := time.Time{}
+ 		for {
+-			var isReloaded bool
+-			if entry.CertificatePath != "" && entry.KeyPath != "" {
+-				newCert, err := filesystem.ReadCert(entry.CertificatePath)
+-				if err != nil {
+-					errors.LogErrorInner(context.Background(), err, "failed to parse certificate")
+-					return
+-				}
+-				newKey, err := filesystem.ReadCert(entry.KeyPath)
+-				if err != nil {
+-					errors.LogErrorInner(context.Background(), err, "failed to parse key")
+-					return
+-				}
+-				if string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key) {
+-					entry.Certificate = newCert
+-					entry.Key = newKey
+-					isReloaded = true
+-				}
+-			}
+-			callback(isReloaded, isOcspstapling)
+-			<-t.C
++			changed, err := reloadCertificatePair(entry)
++			if err != nil {
++				errors.LogWarningInner(context.Background(), err, "certificate reload failed; keeping active pair")
++			}
++			ocspDue := entry.OcspStapling != 0 && !time.Now().Before(nextOCSP)
++			if ocspDue {
++				nextOCSP = time.Now().Add(time.Duration(entry.OcspStapling) * time.Second)
++			}
++			if changed || ocspDue {
++				callback(changed, ocspDue)
++			}
++			select {
++			case <-ticker.C:
++			case <-stop:
++				return
++			}
+ 		}
+ 	}()
++	return done
++}
++
++type certificateWatchLifetime struct{ stop chan struct{} }
++
++func (c *Config) managedGetCertificate() func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
++	lifetime := &certificateWatchLifetime{stop: make(chan struct{})}
++	// TLS.Config.Clone copies the getter closure, so the lifetime follows every
++	// live clone. Watchers retain only stop, never the lifetime token itself.
++	runtime.AddCleanup(lifetime, func(stop chan struct{}) { close(stop) }, lifetime.stop)
++	getter := getNewGetCertificateFunc(c.buildCertificates(lifetime.stop), c.RejectUnknownSni)
++	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
++		cert, err := getter(hello)
++		runtime.KeepAlive(lifetime)
++		return cert, err
++	}
+ }
+ 
+ func isCertificateExpired(c *tls.Certificate) bool {
+@@ -245,6 +305,8 @@
+ 
+ func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+ 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
++		certificateReloadMu.RLock()
++		defer certificateReloadMu.RUnlock()
+ 		if len(certs) == 0 {
+ 			return nil, errNoCertificates
+ 		}
+@@ -411,7 +473,7 @@
+ 	if len(caCerts) > 0 {
+ 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
+ 	} else {
+-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
++		config.GetCertificate = c.managedGetCertificate()
+ 	}
+ 
+ 	if sn := c.parseServerName(); len(sn) > 0 {
+diff --git a/transport/internet/tls/certificate_reload_test.go b/transport/internet/tls/certificate_reload_test.go
+new file mode 100644
+--- /dev/null
++++ b/transport/internet/tls/certificate_reload_test.go
+@@ -0,0 +1,146 @@
++//go:build linux
++
++package tls
++
++import (
++	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	ctls "crypto/tls"
++	"crypto/x509"
++	"encoding/pem"
++	"math/big"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/platform/filesystem"
++)
++
++func reloadTestPair(t *testing.T) ([]byte, []byte) {
++	t.Helper()
++	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
++	c := &x509.Certificate{SerialNumber: serial, DNSNames: []string{"node.example.invalid"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(90 * 24 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
++	der, err := x509.CreateCertificate(rand.Reader, c, c, k.Public(), k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	key, _ := x509.MarshalECPrivateKey(k)
++	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: key})
++}
++
++func TestReloadKeepsPairOnReadAndValidationFailures(t *testing.T) {
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert"), filepath.Join(dir, "key")
++	a, ak := reloadTestPair(t)
++	b, bk := reloadTestPair(t)
++	entry := &Certificate{Certificate: a, Key: ak, CertificatePath: cp, KeyPath: kp}
++	if _, err := reloadCertificatePair(entry); err == nil {
++		t.Fatal("missing files accepted")
++	}
++	if !bytes.Equal(entry.Certificate, a) {
++		t.Fatal("active cert changed")
++	}
++	os.WriteFile(cp, b, 0644)
++	os.WriteFile(kp, ak, 0600)
++	if _, err := reloadCertificatePair(entry); err == nil {
++		t.Fatal("mixed pair accepted")
++	}
++	if !bytes.Equal(entry.Certificate, a) {
++		t.Fatal("active cert changed on mismatch")
++	}
++	os.WriteFile(kp, bk, 0600)
++	changed, err := reloadCertificatePair(entry)
++	if err != nil || !changed || !bytes.Equal(entry.Certificate, b) {
++		t.Fatalf("failed to recover: %v", err)
++	}
++}
++
++func TestCertificateWatcherStops(t *testing.T) {
++	stop := make(chan struct{})
++	done := setupOcspTicker(&Certificate{OcspStapling: 3600}, func(bool, bool) {}, stop)
++	close(stop)
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("certificate watcher did not stop")
++	}
++}
++
++func TestActualTLSHandshakeRecoversAfterFailedReload(t *testing.T) {
++	dir := t.TempDir()
++	cp, kp := filepath.Join(dir, "cert"), filepath.Join(dir, "key")
++	a, ak := reloadTestPair(t)
++	b, bk := reloadTestPair(t)
++	if err := filesystem.WriteCertificatePair(cp, kp, a, ak, "node.example.invalid"); err != nil {
++		t.Fatal(err)
++	}
++	cert, key, err := filesystem.ReadCertificatePair(cp, kp)
++	if err != nil {
++		t.Fatal(err)
++	}
++	config := (&Config{Certificate: []*Certificate{{Certificate: cert, Key: key, CertificatePath: cp, KeyPath: kp}}, RejectUnknownSni: true}).GetTLSConfig()
++	listener, err := ctls.Listen("tcp", "127.0.0.1:0", config)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			go func(conn net.Conn) {
++				defer conn.Close()
++				conn.SetDeadline(time.Now().Add(2 * time.Second))
++				conn.(*ctls.Conn).Handshake()
++			}(conn)
++		}
++	}()
++	pool := x509.NewCertPool()
++	pool.AppendCertsFromPEM(a)
++	pool.AppendCertsFromPEM(b)
++	observed := func() []byte {
++		t.Helper()
++		conn, err := ctls.DialWithDialer(&net.Dialer{Timeout: 2 * time.Second}, "tcp", listener.Addr().String(), &ctls.Config{RootCAs: pool, ServerName: "node.example.invalid"})
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer conn.Close()
++		return conn.ConnectionState().PeerCertificates[0].Raw
++	}
++	blockA, _ := pem.Decode(a)
++	blockB, _ := pem.Decode(b)
++	if !bytes.Equal(observed(), blockA.Bytes) {
++		t.Fatal("old pair not served")
++	}
++	// Let a real watcher encounter a missing key; it must keep serving old TLS.
++	if err := os.Rename(kp, kp+".saved"); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(5500 * time.Millisecond)
++	if !bytes.Equal(observed(), blockA.Bytes) {
++		t.Fatal("lost active TLS on read failure")
++	}
++	if err := os.Rename(kp+".saved", kp); err != nil {
++		t.Fatal(err)
++	}
++	if err := filesystem.WriteCertificatePair(cp, kp, b, bk, "node.example.invalid"); err != nil {
++		t.Fatal(err)
++	}
++	deadline := time.Now().Add(8 * time.Second)
++	for {
++		if bytes.Equal(observed(), blockB.Bytes) {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("watcher failed to load renewed certificate after error")
++		}
++		time.Sleep(200 * time.Millisecond)
++	}
++}

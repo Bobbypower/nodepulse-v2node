@@ -1,0 +1,1411 @@
+diff --git a/api/v2board/user.go b/api/v2board/user.go
+--- a/api/v2board/user.go
++++ b/api/v2board/user.go
+@@ -7,8 +7,8 @@
+ 	"strings"
+ 	"time"
+ 
+-	"encoding/json/jsontext"
+ 	"encoding/json/v2"
++	"io"
+ 
+ 	"github.com/vmihailenco/msgpack/v5"
+ )
+@@ -35,62 +35,40 @@
+ 
+ // GetUserList will pull user from v2board
+ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
+-	const path = "/api/v1/server/UniProxy/user"
+-	r, err := c.client.R().
+-		SetContext(ctx).
+-		SetHeader("If-None-Match", c.userEtag).
+-		SetHeader("X-Response-Format", "msgpack").
+-		SetDoNotParseResponse(true).
+-		Get(path)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if r == nil || r.RawResponse == nil {
+-		return nil, fmt.Errorf("received nil response or raw response")
++	r, err := c.client.R().SetContext(ctx).SetHeader("If-None-Match", c.userEtag).
++		SetHeader("X-Response-Format", "msgpack").SetDoNotParseResponse(true).Get("/api/v1/server/UniProxy/user")
++	if err != nil || r == nil || r.RawResponse == nil {
++		return nil, errors.New("user list request failed")
+ 	}
+ 	defer r.RawResponse.Body.Close()
+-
+ 	if r.StatusCode() == 304 {
+ 		return nil, nil
+ 	}
+-	userlist := &UserListBody{}
++	if r.StatusCode() != 200 {
++		return nil, fmt.Errorf("user list HTTP status %d", r.StatusCode())
++	}
++	body, err := io.ReadAll(io.LimitReader(r.RawResponse.Body, 8*1024*1024+1))
++	if err != nil || len(body) > 8*1024*1024 {
++		return nil, errors.New("invalid user list size")
++	}
++	var users UserListBody
+ 	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
+-		decoder := msgpack.NewDecoder(r.RawResponse.Body)
+-		if err := decoder.Decode(userlist); err != nil {
+-			return nil, fmt.Errorf("decode user list error: %w", err)
++		err = msgpack.Unmarshal(body, &users)
++	} else {
++		err = json.Unmarshal(body, &users)
++	}
++	if err != nil || users.Users == nil {
++		return nil, errors.New("invalid user list payload")
++	}
++	ids, uuids := make(map[int]bool), make(map[string]bool)
++	for _, user := range users.Users {
++		if user.Id <= 0 || user.Uuid == "" || ids[user.Id] || uuids[user.Uuid] {
++			return nil, errors.New("invalid or duplicate user identity")
+ 		}
+-	} else {
+-		dec := jsontext.NewDecoder(r.RawResponse.Body)
+-		for {
+-			tok, err := dec.ReadToken()
+-			if err != nil {
+-				return nil, fmt.Errorf("decode user list error: %w", err)
+-			}
+-			if tok.Kind() == '"' && tok.String() == "users" {
+-				break
+-			}
+-		}
+-		tok, err := dec.ReadToken()
+-		if err != nil {
+-			return nil, fmt.Errorf("decode user list error: %w", err)
+-		}
+-		if tok.Kind() != '[' {
+-			return nil, fmt.Errorf(`decode user list error: expected "users" array`)
+-		}
+-		for dec.PeekKind() != ']' {
+-			val, err := dec.ReadValue()
+-			if err != nil {
+-				return nil, fmt.Errorf("decode user list error: read user object: %w", err)
+-			}
+-			var u UserInfo
+-			if err := json.Unmarshal(val, &u); err != nil {
+-				return nil, fmt.Errorf("decode user list error: unmarshal user error: %w", err)
+-			}
+-			userlist.Users = append(userlist.Users, u)
+-		}
++		ids[user.Id], uuids[user.Uuid] = true, true
+ 	}
+ 	c.userEtag = r.Header().Get("ETag")
+-	return userlist.Users, nil
++	return users.Users, nil
+ }
+ 
+ // GetUserAlive will fetch the alive_ip count for users
+diff --git a/api/v2board/panel.go b/api/v2board/panel.go
+--- a/api/v2board/panel.go
++++ b/api/v2board/panel.go
+@@ -28,6 +28,7 @@
+ 
+ func New(c *conf.NodeConfig) (*Client, error) {
+ 	client := resty.New()
++	client.SetLogger(panelLogger{secret: c.Key})
+ 	retryCount := conf.DefaultNodeRetryCount
+ 	if c.RetryCount != nil {
+ 		retryCount = *c.RetryCount
+@@ -44,7 +45,7 @@
+ 		if errors.As(err, &v) {
+ 			// v.Response contains the last response from the server
+ 			// v.Err contains the original error
+-			logrus.Error(v.Err)
++			logrus.Error(redactPanelMessage(v.Err.Error(), c.Key))
+ 		}
+ 	})
+ 	client.SetBaseURL(c.APIHost)
+diff --git a/node/controller.go b/node/controller.go
+--- a/node/controller.go
++++ b/node/controller.go
+@@ -2,7 +2,6 @@
+ 
+ import (
+ 	"context"
+-	"errors"
+ 	"fmt"
+ 
+ 	log "github.com/sirupsen/logrus"
+@@ -14,6 +13,7 @@
+ )
+ 
+ type Controller struct {
++	accounts                *accountRestrictions
+ 	server                  *core.V2Core
+ 	apiClient               *panel.Client
+ 	tag                     string
+@@ -56,9 +56,7 @@
+ 	if err != nil {
+ 		return fmt.Errorf("get user list error: %s", err)
+ 	}
+-	if len(c.userList) == 0 {
+-		return errors.New("add users error: not have any user")
+-	}
++
+ 	c.aliveMap, err = c.apiClient.GetUserAlive(context.Background())
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get user alive list: %s", err)
+diff --git a/node/task.go b/node/task.go
+--- a/node/task.go
++++ b/node/task.go
+@@ -8,7 +8,6 @@
+ 	log "github.com/sirupsen/logrus"
+ 	panel "github.com/wyx2685/v2node/api/v2board"
+ 	"github.com/wyx2685/v2node/common/task"
+-	vCore "github.com/wyx2685/v2node/core"
+ )
+ 
+ func (c *Controller) startTasks(node *panel.NodeInfo) {
+@@ -49,6 +48,10 @@
+ }
+ 
+ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
++	if restrictionError := c.pullAccountRestrictions(ctx); restrictionError != nil {
++		log.WithField("tag", c.tag).Warn("Account enforcement pending; retaining known restrictions")
++	}
++
+ 	// get node info
+ 	newN, err := c.apiClient.GetNodeInfo(ctx)
+ 	if err != nil {
+@@ -106,45 +109,9 @@
+ 		c.limiter.AliveList = newA
+ 	}
+ 	// node no changed, check users
+-	if len(newU) == 0 {
++	if newU == nil {
+ 		log.WithField("tag", c.tag).Debug("User list no change")
+ 		return nil
+ 	}
+-	deleted, added, modified := compareUserList(c.userList, newU)
+-	if len(deleted) > 0 {
+-		// have deleted users
+-		err = c.server.DelUsers(deleted, c.tag, c.info)
+-		if err != nil {
+-			log.WithFields(log.Fields{
+-				"tag": c.tag,
+-				"err": err,
+-			}).Error("Delete users failed")
+-			return nil
+-		}
+-	}
+-	if len(added) > 0 {
+-		// have added users
+-		_, err = c.server.AddUsers(&vCore.AddUsersParams{
+-			Tag:      c.tag,
+-			NodeInfo: c.info,
+-			Users:    added,
+-		})
+-		if err != nil {
+-			log.WithFields(log.Fields{
+-				"tag": c.tag,
+-				"err": err,
+-			}).Error("Add users failed")
+-			return nil
+-		}
+-	}
+-	if len(added) > 0 || len(deleted) > 0 || len(modified) > 0 {
+-		// update Limiter
+-		c.limiter.UpdateUser(c.tag, added, deleted, modified)
+-		if vCore.HasXHTTPDownloadInbound(c.info) {
+-			c.limiter.UpdateUser(vCore.XHTTPDownloadTag(c.tag), added, deleted, modified)
+-		}
+-	}
+-	c.userList = newU
+-	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
+-	return nil
++	return c.applyAccountUsers(ctx, newU)
+ }
+diff --git a/core/user.go b/core/user.go
+--- a/core/user.go
++++ b/core/user.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"encoding/base64"
++	"errors"
+ 	"fmt"
+ 	"strings"
+ 	"time"
+@@ -10,7 +11,6 @@
+ 	panel "github.com/wyx2685/v2node/api/v2board"
+ 	"github.com/wyx2685/v2node/common/counter"
+ 	"github.com/wyx2685/v2node/common/format"
+-	"github.com/wyx2685/v2node/core/app/dispatcher"
+ 	"github.com/xtls/xray-core/common/protocol"
+ 	"github.com/xtls/xray-core/common/serial"
+ 	"github.com/xtls/xray-core/infra/conf"
+@@ -42,39 +42,79 @@
+ 	return userManager, nil
+ }
+ 
+-func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {
++func (vc *V2Core) RevokeUserID(uid int, tag string, info *panel.NodeInfo) ([]panel.UserInfo, error) {
+ 	tags := []string{tag}
+ 	if HasXHTTPDownloadInbound(info) {
+ 		tags = append(tags, XHTTPDownloadTag(tag))
+ 	}
++	found := make(map[string]panel.UserInfo)
++	vc.users.mapLock.RLock()
++	for email, userID := range vc.users.uidMap {
++		if userID != uid {
++			continue
++		}
++		for _, targetTag := range tags {
++			prefix := format.UserTag(targetTag, "")
++			if strings.HasPrefix(email, prefix) {
++				uuid := strings.TrimPrefix(email, prefix)
++				found[uuid] = panel.UserInfo{Id: uid, Uuid: uuid}
++			}
++		}
++	}
++	vc.users.mapLock.RUnlock()
++	users := make([]panel.UserInfo, 0, len(found))
++	for _, user := range found {
++		users = append(users, user)
++	}
++	return users, vc.DelUsers(users, tag, info)
++}
++
++func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error {
+ 	vc.users.mapLock.Lock()
+ 	defer vc.users.mapLock.Unlock()
++	tags := []string{tag}
++	if HasXHTTPDownloadInbound(info) {
++		tags = append(tags, XHTTPDownloadTag(tag))
++	}
+ 	for _, targetTag := range tags {
+-		userManager, err := vc.GetUserManager(targetTag)
+-		if err != nil {
+-			return fmt.Errorf("get user manager error: %s", err)
+-		}
+-		for i := range users {
+-			user := format.UserTag(targetTag, users[i].Uuid)
+-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+-			err = userManager.RemoveUser(ctx, user)
+-			cancel()
+-			if err != nil {
+-				return err
+-			}
+-			delete(vc.users.uidMap, user)
++		for _, user := range users {
++			vc.dispatcher.DeniedUsers.Store(format.UserTag(targetTag, user.Uuid), true)
++		}
++	}
++	var failures []error
++	for _, targetTag := range tags {
++		manager, managerError := vc.GetUserManager(targetTag)
++		if managerError != nil {
++			failures = append(failures, managerError)
++		}
++		for _, user := range users {
++			email := format.UserTag(targetTag, user.Uuid)
++			if err := vc.dispatcher.DenyUser(email); err != nil {
++				failures = append(failures, err)
++				continue
++			}
++			if _, exists := vc.users.uidMap[email]; exists {
++				if managerError != nil {
++					continue
++				}
++				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++				var err error
++				if manager.GetUser(ctx, email) != nil {
++					err = manager.RemoveUser(ctx, email)
++				}
++				cancel()
++				if err != nil {
++					failures = append(failures, err)
++					continue
++				}
++			}
++			delete(vc.users.uidMap, email)
+ 			if value, ok := vc.dispatcher.Counter.Load(targetTag); ok {
+-				tc := value.(*counter.TrafficCounter)
+-				tc.Delete(user)
+-			}
+-			if value, ok := vc.dispatcher.LinkManagers.Load(user); ok {
+-				lm := value.(*dispatcher.LinkManager)
+-				lm.CloseAll()
+-				vc.dispatcher.LinkManagers.Delete(user)
+-			}
+-		}
+-	}
+-	return nil
++				value.(*counter.TrafficCounter).Delete(email)
++			}
++		}
++	}
++	return errors.Join(failures...)
+ }
+ 
+ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
+@@ -132,28 +172,35 @@
+ 		tags = append(tags, XHTTPDownloadTag(p.Tag))
+ 	}
+ 	for _, targetTag := range tags {
+-		for i := range p.Users {
+-			v.users.uidMap[format.UserTag(targetTag, p.Users[i].Uuid)] = p.Users[i].Id
+-		}
+ 		users, err := buildUsersForTag(targetTag, p)
+ 		if err != nil {
+ 			return 0, err
+ 		}
+-		man, err := v.GetUserManager(targetTag)
++		manager, err := v.GetUserManager(targetTag)
+ 		if err != nil {
+-			return 0, fmt.Errorf("get user manager error: %s", err)
+-		}
+-		for _, u := range users {
+-			mUser, err := u.ToMemoryUser()
++			return 0, err
++		}
++		for i, user := range users {
++			email := format.UserTag(targetTag, p.Users[i].Uuid)
++			_, denied := v.dispatcher.DeniedUsers.Load(email)
++			if current, exists := v.users.uidMap[email]; exists && current == p.Users[i].Id && !denied && manager.GetUser(context.Background(), email) != nil {
++				continue
++			}
++			memory, err := user.ToMemoryUser()
+ 			if err != nil {
+ 				return 0, err
+ 			}
+ 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+-			err = man.AddUser(ctx, mUser)
++			if denied {
++				_ = manager.RemoveUser(ctx, email)
++			}
++			err = manager.AddUser(ctx, memory)
+ 			cancel()
+ 			if err != nil {
+ 				return 0, err
+ 			}
++			v.users.uidMap[email] = p.Users[i].Id
++			v.dispatcher.AllowUser(email)
+ 		}
+ 	}
+ 	return len(p.Users), nil
+diff --git a/core/app/dispatcher/default.go b/core/app/dispatcher/default.go
+--- a/core/app/dispatcher/default.go
++++ b/core/app/dispatcher/default.go
+@@ -106,6 +106,7 @@
+ 	stats        stats.Manager
+ 	fdns         dns.FakeDNSEngine
+ 	Counter      sync.Map
++	DeniedUsers  sync.Map
+ 	LinkManagers sync.Map // map[string]*LinkManager
+ 	auditMu      sync.RWMutex
+ 	auditSink    func(AuditHit)
+@@ -200,6 +201,13 @@
+ 	var limit *limiter.Limiter
+ 	var err error
+ 	if user != nil && len(user.Email) > 0 {
++		if _, denied := d.DeniedUsers.Load(user.Email); denied {
++			common.Close(outboundLink.Writer)
++			common.Close(inboundLink.Writer)
++			common.Interrupt(outboundLink.Reader)
++			common.Interrupt(inboundLink.Reader)
++			return nil, nil, nil, errors.New("Account access revoked")
++		}
+ 		limit, err = limiter.GetLimiter(sessionInbound.Tag)
+ 		if err != nil {
+ 			errors.LogInfo(ctx, "get limiter ", sessionInbound.Tag, " error: ", err)
+@@ -221,20 +229,20 @@
+ 			common.Interrupt(inboundLink.Reader)
+ 			return nil, nil, nil, errors.New("Limited ", user.Email, " by conn or ip")
+ 		}
+-		var lm *LinkManager
+-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
+-			lm = &LinkManager{
+-				links: make(map[*ManagedWriter]buf.Reader),
+-			}
+-			d.LinkManagers.Store(user.Email, lm)
+-		} else {
+-			lm = lmloaded.(*LinkManager)
+-		}
++		stored, _ := d.LinkManagers.LoadOrStore(user.Email, &LinkManager{links: make(map[*ManagedWriter]buf.Reader)})
++		lm := stored.(*LinkManager)
+ 		managedWriter := &ManagedWriter{
+ 			writer:  uplinkWriter,
+ 			manager: lm,
+-		}
+-		lm.AddLink(managedWriter, outboundLink.Reader)
++			peers:   []any{outboundLink.Writer, inboundLink.Reader},
++		}
++		if !lm.AddLink(managedWriter, outboundLink.Reader) || !lm.TrackConnection(ctx, sessionInbound.Conn) {
++			common.Close(outboundLink.Writer)
++			common.Close(inboundLink.Writer)
++			common.Interrupt(outboundLink.Reader)
++			common.Interrupt(inboundLink.Reader)
++			return nil, nil, nil, errors.New("Account access revoked")
++		}
+ 		inboundLink.Writer = managedWriter
+ 		if w != nil {
+ 			sessionInbound.CanSpliceCopy = 3
+@@ -386,6 +394,11 @@
+ 	var limit *limiter.Limiter
+ 	var err error
+ 	if user != nil && len(user.Email) > 0 {
++		if _, denied := d.DeniedUsers.Load(user.Email); denied {
++			common.Close(outbound.Writer)
++			common.Interrupt(outbound.Reader)
++			return errors.New("Account access revoked")
++		}
+ 		limit, err = limiter.GetLimiter(sessionInbound.Tag)
+ 		if err != nil {
+ 			errors.LogInfo(ctx, "get limiter ", sessionInbound.Tag, " error: ", err)
+@@ -403,15 +416,8 @@
+ 			common.Interrupt(outbound.Reader)
+ 			return errors.New("Limited ", user.Email, " by conn or ip")
+ 		}
+-		var lm *LinkManager
+-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
+-			lm = &LinkManager{
+-				links: make(map[*ManagedWriter]buf.Reader),
+-			}
+-			d.LinkManagers.Store(user.Email, lm)
+-		} else {
+-			lm = lmloaded.(*LinkManager)
+-		}
++		stored, _ := d.LinkManagers.LoadOrStore(user.Email, &LinkManager{links: make(map[*ManagedWriter]buf.Reader)})
++		lm := stored.(*LinkManager)
+ 		managedWriter := &ManagedWriter{
+ 			writer:  outbound.Writer,
+ 			manager: lm,
+@@ -431,11 +437,17 @@
+ 
+ 		ts := t.GetCounter(user.Email)
+ 		downcounter := &counter.XrayTrafficCounter{V: &ts.DownCounter}
++		managedReader := outbound.Reader
+ 		outbound.Reader = &CounterReader{
+ 			Reader:  &buf.TimeoutWrapperReader{Reader: outbound.Reader},
+ 			Counter: &ts.UpCounter,
+ 		}
+-		lm.AddLink(managedWriter, outbound.Reader)
++		if !lm.AddLink(managedWriter, managedReader) || !lm.TrackConnection(ctx, sessionInbound.Conn) {
++			common.Close(outbound.Writer)
++			common.Interrupt(outbound.Reader)
++			common.Interrupt(managedReader)
++			return errors.New("Account access revoked")
++		}
+ 		outbound.Writer = &dispatcher.SizeStatWriter{
+ 			Counter: downcounter,
+ 			Writer:  outbound.Writer,
+diff --git a/core/app/dispatcher/linkmanager.go b/core/app/dispatcher/linkmanager.go
+--- a/core/app/dispatcher/linkmanager.go
++++ b/core/app/dispatcher/linkmanager.go
+@@ -1,6 +1,9 @@
+ package dispatcher
+ 
+ import (
++	"context"
++	"errors"
++	"net"
+ 	sync "sync"
+ 
+ 	"github.com/xtls/xray-core/common"
+@@ -10,6 +13,7 @@
+ type ManagedWriter struct {
+ 	writer  buf.Writer
+ 	manager *LinkManager
++	peers   []any
+ }
+ 
+ func (w *ManagedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+@@ -22,17 +26,61 @@
+ }
+ 
+ type LinkManager struct {
+-	links  map[*ManagedWriter]buf.Reader
+-	mu     sync.RWMutex
+-	closed bool
++	links       map[*ManagedWriter]buf.Reader
++	mu          sync.RWMutex
++	closeMu     sync.Mutex
++	closed      bool
++	connections map[net.Conn]int
+ }
+ 
+-func (m *LinkManager) AddLink(writer *ManagedWriter, reader buf.Reader) {
++// Protocol body wrappers may not implement Close/Interrupt. Retain the actual
++// authenticated transport until its context finishes, independently of a
++// writer half-close, so an upload EOF cannot hide a live download from a ban.
++func (m *LinkManager) TrackConnection(ctx context.Context, conn net.Conn) bool {
++	if conn == nil {
++		return true
++	}
+ 	m.mu.Lock()
+-	defer m.mu.Unlock()
+-	if !m.closed {
+-		m.links[writer] = reader
++	if m.closed {
++		m.mu.Unlock()
++		_ = conn.Close()
++		return false
+ 	}
++	if m.connections == nil {
++		m.connections = make(map[net.Conn]int)
++	}
++	m.connections[conn]++
++	m.mu.Unlock()
++	if ctx.Done() != nil {
++		go func() {
++			<-ctx.Done()
++			m.mu.Lock()
++			defer m.mu.Unlock()
++			if !m.closed {
++				m.connections[conn]--
++				if m.connections[conn] <= 0 {
++					delete(m.connections, conn)
++				}
++			}
++		}()
++	}
++	return true
++}
++
++func (m *LinkManager) AddLink(writer *ManagedWriter, reader buf.Reader) bool {
++	m.mu.Lock()
++	if m.closed {
++		m.mu.Unlock()
++		common.Close(writer)
++		common.Interrupt(reader)
++		return false
++	}
++	if m.links == nil {
++		m.links = make(map[*ManagedWriter]buf.Reader)
++	}
++	m.links[writer] = reader
++	m.mu.Unlock()
++	return true
+ }
+ 
+ func (m *LinkManager) RemoveWriter(writer *ManagedWriter) {
+@@ -43,20 +91,50 @@
+ 	}
+ }
+ 
+-func (m *LinkManager) CloseAll() {
++func (m *LinkManager) CloseAll() error {
++	m.closeMu.Lock()
++	defer m.closeMu.Unlock()
+ 	m.mu.Lock()
+-	if m.closed {
+-		m.mu.Unlock()
+-		return
++	m.closed = true
++	links := m.links
++	connections := m.connections
++	m.links = make(map[*ManagedWriter]buf.Reader)
++	m.connections = make(map[net.Conn]int)
++	m.mu.Unlock()
++	var failures []error
++	for conn := range connections {
++		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
++			failures = append(failures, err)
++			m.mu.Lock()
++			m.connections[conn] = 1
++			m.mu.Unlock()
++		}
+ 	}
+-	m.closed = true
++	for writer, reader := range links {
++		for _, peer := range writer.peers {
++			common.Interrupt(peer)
++		}
++		err := common.Close(writer)
++		common.Interrupt(reader)
++		if err != nil && !errors.Is(err, net.ErrClosed) {
++			failures = append(failures, err)
++			m.mu.Lock()
++			m.links[writer] = reader
++			m.mu.Unlock()
++		}
++	}
++	return errors.Join(failures...)
++}
+ 
+-	links := m.links
+-	m.links = make(map[*ManagedWriter]buf.Reader)
+-	m.mu.Unlock()
++func (d *DefaultDispatcher) DenyUser(email string) error {
++	d.DeniedUsers.Store(email, true)
++	value, _ := d.LinkManagers.LoadOrStore(email, &LinkManager{links: make(map[*ManagedWriter]buf.Reader)})
++	return value.(*LinkManager).CloseAll()
++}
+ 
+-	for w, r := range links {
+-		common.Close(w.writer)
+-		common.Interrupt(r)
++func (d *DefaultDispatcher) AllowUser(email string) {
++	if _, denied := d.DeniedUsers.Load(email); denied {
++		d.LinkManagers.Delete(email)
++		d.DeniedUsers.Delete(email)
+ 	}
+ }
+diff --git a/api/v2board/account_enforcement.go b/api/v2board/account_enforcement.go
+new file mode 100644
+--- /dev/null
++++ b/api/v2board/account_enforcement.go
+@@ -0,0 +1,104 @@
++package panel
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/url"
++	"strconv"
++	"strings"
++
++	log "github.com/sirupsen/logrus"
++)
++
++const EnforcementCapability = "nodepulse-enforcement/1"
++
++type AccountCommand struct {
++	UserID     int    `json:"user_id"`
++	Version    int64  `json:"version"`
++	Blocked    bool   `json:"blocked"`
++	DeliveryID string `json:"delivery_id"`
++}
++
++func redactPanelMessage(message, secret string) string {
++	if secret == "" {
++		return message
++	}
++	return strings.ReplaceAll(strings.ReplaceAll(message, secret, "[redacted]"), url.QueryEscape(secret), "[redacted]")
++}
++
++type panelLogger struct{ secret string }
++
++func (l panelLogger) Errorf(format string, args ...interface{}) {
++	log.Error(redactPanelMessage(fmt.Sprintf(format, args...), l.secret))
++}
++func (l panelLogger) Warnf(format string, args ...interface{}) {
++	log.Warn(redactPanelMessage(fmt.Sprintf(format, args...), l.secret))
++}
++func (l panelLogger) Debugf(format string, args ...interface{}) {
++	log.Debug(redactPanelMessage(fmt.Sprintf(format, args...), l.secret))
++}
++
++func (c *Client) AccountCommands(ctx context.Context, instance string) ([]AccountCommand, error) {
++	result := make([]AccountCommand, 0)
++	cursor := 0
++	for page := 0; page < 64; page++ {
++		var body struct {
++			Commands []struct {
++				UserID     int    `json:"user_id"`
++				Version    int64  `json:"version"`
++				Blocked    *bool  `json:"blocked"`
++				DeliveryID string `json:"delivery_id"`
++			} `json:"commands"`
++			Next int `json:"next_cursor"`
++		}
++		response, err := c.client.R().SetContext(ctx).SetQueryParam("runtime_instance", instance).
++			SetQueryParam("after", strconv.Itoa(cursor)).SetResult(&body).Get("/api/v2/server/account-enforcement")
++		if err != nil || response == nil {
++			return nil, errors.New("account enforcement request failed")
++		}
++		if response.StatusCode() == 404 {
++			return result, nil
++		}
++		if response.StatusCode() != 200 || body.Commands == nil {
++			return nil, errors.New("invalid account enforcement response")
++		}
++		for _, command := range body.Commands {
++			if command.UserID <= 0 || command.Version <= 0 || command.Blocked == nil || len(command.DeliveryID) != 36 {
++				return nil, errors.New("invalid account enforcement command")
++			}
++			result = append(result, AccountCommand{UserID: command.UserID, Version: command.Version, Blocked: *command.Blocked, DeliveryID: command.DeliveryID})
++		}
++		if body.Next == 0 {
++			return result, nil
++		}
++		if body.Next <= cursor {
++			return nil, errors.New("account enforcement cursor did not advance")
++		}
++		cursor = body.Next
++	}
++	return nil, errors.New("account enforcement page limit reached")
++}
++
++func (c *Client) AccountReceipt(ctx context.Context, instance string, command AccountCommand, applied bool) error {
++	outcome := "failed"
++	if applied {
++		outcome = "applied"
++	}
++	body := map[string]any{"user_id": command.UserID, "version": command.Version, "delivery_id": command.DeliveryID,
++		"runtime_instance": instance, "runtime_version": EnforcementCapability, "outcome": outcome,
++		"connections_cleared": applied && command.Blocked}
++	if !applied {
++		body["error_code"] = "apply_failed"
++		if command.Blocked {
++			body["error_code"] = "remove_failed"
++		}
++	}
++	response, err := c.client.R().SetContext(ctx).SetBody(body).Post("/api/v2/server/account-enforcement/ack")
++	if err != nil || response == nil || response.StatusCode() != 200 {
++		return errors.New("account enforcement receipt not accepted")
++	}
++	return nil
++}
++
++func (c *Client) ResetUserETag() { c.userEtag = "" }
+diff --git a/api/v2board/account_enforcement_test.go b/api/v2board/account_enforcement_test.go
+new file mode 100644
+--- /dev/null
++++ b/api/v2board/account_enforcement_test.go
+@@ -0,0 +1,71 @@
++package panel
++
++import (
++	"context"
++	"github.com/go-resty/resty/v2"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++)
++
++func TestEmptyUserSnapshotIsDifferentFromNotModifiedAndInvalidPayload(t *testing.T) {
++	cases := []struct {
++		name             string
++		code             int
++		body             string
++		valid, unchanged bool
++	}{
++		{"empty", 200, `{"users":[]}`, true, false},
++		{"304", 304, "", true, true},
++		{"missing", 200, `{}`, false, false},
++		{"null", 200, `{"users":null}`, false, false},
++		{"error status", 500, `{"users":[]}`, false, false},
++		{"duplicate", 200, `{"users":[{"id":1,"uuid":"a"},{"id":1,"uuid":"b"}]}`, false, false},
++	}
++	for _, item := range cases {
++		t.Run(item.name, func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.Header().Set("Content-Type", "application/json")
++				w.Header().Set("ETag", "new")
++				w.WriteHeader(item.code)
++				_, _ = w.Write([]byte(item.body))
++			}))
++			defer server.Close()
++			client := &Client{client: resty.New().SetBaseURL(server.URL), userEtag: "old"}
++			users, err := client.GetUserList(context.Background())
++			if (err == nil) != item.valid {
++				t.Fatalf("valid=%v error=%v", item.valid, err)
++			}
++			if item.valid && (users == nil) != item.unchanged {
++				t.Fatalf("empty versus unchanged confused: %#v", users)
++			}
++			if (!item.valid || item.unchanged) && client.userEtag != "old" {
++				t.Fatal("invalid/unapplied response advanced the ETag")
++			}
++		})
++	}
++}
++
++func TestAccountCommandRequiresExplicitRestrictionState(t *testing.T) {
++	for _, body := range []string{
++		`{"commands":[{"user_id":101,"version":1,"delivery_id":"11111111-1111-4111-8111-111111111111"}],"next_cursor":0}`,
++		`{"commands":[{"user_id":101,"version":1,"blocked":null,"delivery_id":"11111111-1111-4111-8111-111111111111"}],"next_cursor":0}`,
++	} {
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = w.Write([]byte(body))
++		}))
++		client := &Client{client: resty.New().SetBaseURL(server.URL)}
++		if _, err := client.AccountCommands(context.Background(), "isolated_runtime_0001"); err == nil {
++			t.Fatal("missing restriction state was treated as release")
++		}
++		server.Close()
++	}
++	secret := "synthetic+test/token"
++	message := redactPanelMessage("GET ?token="+url.QueryEscape(secret)+" "+secret, secret)
++	if strings.Contains(message, secret) || strings.Contains(message, url.QueryEscape(secret)) {
++		t.Fatal("request logger retained a synthetic API secret")
++	}
++}
+diff --git a/node/account_enforcement.go b/node/account_enforcement.go
+new file mode 100644
+--- /dev/null
++++ b/node/account_enforcement.go
+@@ -0,0 +1,133 @@
++package node
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"errors"
++	panel "github.com/wyx2685/v2node/api/v2board"
++	vCore "github.com/wyx2685/v2node/core"
++)
++
++type accountRestrictions struct {
++	instance string
++	versions map[int]int64
++	blocked  map[int]bool
++	pending  map[int]panel.AccountCommand
++}
++
++func newAccountRestrictions() *accountRestrictions {
++	value := make([]byte, 16)
++	if _, err := rand.Read(value); err != nil {
++		panic("cannot initialize enforcement runtime identity")
++	}
++	return &accountRestrictions{instance: hex.EncodeToString(value), versions: make(map[int]int64),
++		blocked: make(map[int]bool), pending: make(map[int]panel.AccountCommand)}
++}
++
++func (c *Controller) pullAccountRestrictions(ctx context.Context) error {
++	if c.accounts == nil {
++		c.accounts = newAccountRestrictions()
++	}
++	commands, fetchError := c.apiClient.AccountCommands(ctx, c.accounts.instance)
++	if fetchError == nil {
++		for _, command := range commands {
++			if command.Version < c.accounts.versions[command.UserID] {
++				continue
++			}
++			c.accounts.versions[command.UserID] = command.Version
++			c.accounts.pending[command.UserID] = command
++			if command.Blocked {
++				c.accounts.blocked[command.UserID] = true
++			}
++		}
++	}
++	failures := []error{fetchError}
++	for uid, command := range c.accounts.pending {
++		if !command.Blocked {
++			c.apiClient.ResetUserETag()
++			continue
++		}
++		removed, err := c.server.RevokeUserID(uid, c.tag, c.info)
++		if err != nil {
++			_ = c.apiClient.AccountReceipt(ctx, c.accounts.instance, command, false)
++			failures = append(failures, err)
++			continue
++		}
++		c.updateAccountLimiter(nil, removed, nil)
++		filtered := make([]panel.UserInfo, 0, len(c.userList))
++		for _, user := range c.userList {
++			if user.Id != uid {
++				filtered = append(filtered, user)
++			}
++		}
++		c.userList = filtered
++		if err := c.apiClient.AccountReceipt(ctx, c.accounts.instance, command, true); err != nil {
++			failures = append(failures, err)
++		} else {
++			delete(c.accounts.pending, uid)
++		}
++	}
++	return errors.Join(failures...)
++}
++
++func (c *Controller) updateAccountLimiter(added, deleted, modified []panel.UserInfo) {
++	if c.limiter == nil {
++		return
++	}
++	c.limiter.UpdateUser(c.tag, added, deleted, modified)
++	if vCore.HasXHTTPDownloadInbound(c.info) {
++		c.limiter.UpdateUser(vCore.XHTTPDownloadTag(c.tag), added, deleted, modified)
++	}
++}
++
++func (c *Controller) applyAccountUsers(ctx context.Context, users []panel.UserInfo) (err error) {
++	defer func() {
++		if err != nil {
++			c.apiClient.ResetUserETag()
++			if c.accounts != nil {
++				for _, command := range c.accounts.pending {
++					if !command.Blocked {
++						_ = c.apiClient.AccountReceipt(ctx, c.accounts.instance, command, false)
++					}
++				}
++			}
++		}
++	}()
++	desired := make([]panel.UserInfo, 0, len(users))
++	for _, user := range users {
++		blocked := c.accounts != nil && c.accounts.blocked[user.Id]
++		command, releasing := panel.AccountCommand{}, false
++		if c.accounts != nil {
++			command, releasing = c.accounts.pending[user.Id]
++		}
++		if !blocked || releasing && !command.Blocked {
++			desired = append(desired, user)
++		}
++	}
++	deleted, added, modified := compareUserList(c.userList, desired)
++	if len(deleted) > 0 {
++		if err = c.server.DelUsers(deleted, c.tag, c.info); err != nil {
++			return err
++		}
++	}
++	if len(added) > 0 {
++		if _, err = c.server.AddUsers(&vCore.AddUsersParams{Tag: c.tag, NodeInfo: c.info, Users: added}); err != nil {
++			return err
++		}
++	}
++	c.updateAccountLimiter(added, deleted, modified)
++	c.userList = desired
++	if c.accounts != nil {
++		for uid, command := range c.accounts.pending {
++			if command.Blocked {
++				continue
++			}
++			delete(c.accounts.blocked, uid)
++			if receiptError := c.apiClient.AccountReceipt(ctx, c.accounts.instance, command, true); receiptError == nil {
++				delete(c.accounts.pending, uid)
++			}
++		}
++	}
++	return nil
++}
+diff --git a/node/account_enforcement_integration_test.go b/node/account_enforcement_integration_test.go
+new file mode 100644
+--- /dev/null
++++ b/node/account_enforcement_integration_test.go
+@@ -0,0 +1,234 @@
++package node
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"testing"
++	"time"
++
++	panel "github.com/wyx2685/v2node/api/v2board"
++	"github.com/wyx2685/v2node/conf"
++	"github.com/wyx2685/v2node/core"
++	"github.com/wyx2685/v2node/limiter"
++)
++
++// Explicit opt-in: the harness runs the real Commerce and NodePulse routes with
++// isolated SQLite databases, synthetic identities, and localhost listeners.
++func TestAccountEnforcementLocalServices(t *testing.T) {
++	commerceURL, panelURL := os.Getenv("NODE_ENFORCEMENT_COMMERCE_URL"), os.Getenv("NODE_ENFORCEMENT_NODEPULSE_URL")
++	if commerceURL == "" || panelURL == "" {
++		t.Skip("requires isolated local service harness")
++	}
++	for _, endpoint := range []string{commerceURL, panelURL} {
++		parsed, err := url.Parse(endpoint)
++		if err != nil || parsed.Hostname() != "127.0.0.1" {
++			t.Fatal("integration endpoints must be localhost")
++		}
++	}
++	request := func(method, path string, body any) map[string]any {
++		t.Helper()
++		data, _ := json.Marshal(body)
++		req, err := http.NewRequest(method, commerceURL+path, bytes.NewReader(data))
++		if err != nil {
++			t.Fatal(err)
++		}
++		req.Header.Set("Content-Type", "application/json")
++		req.Header.Set("Authorization", "Bearer local-enforcement-test")
++		response, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer response.Body.Close()
++		var value map[string]any
++		if err = json.NewDecoder(response.Body).Decode(&value); err != nil {
++			t.Fatal(err)
++		}
++		if response.StatusCode != 200 {
++			t.Fatalf("local route %s returned %d: %v", path, response.StatusCode, value)
++		}
++		return value
++	}
++	waitIntent := func(version float64, confirmed bool) {
++		t.Helper()
++		deadline := time.Now().Add(12 * time.Second)
++		for time.Now().Before(deadline) {
++			value := request("GET", "/api/v1/admin/abuse-records/users/101/enforcement", nil)
++			state, ok := value["execution"].(map[string]any)
++			if ok && state["revision"] == version && (state["status"] == "waiting_nodes" || state["status"] == "confirmed") && (!confirmed || state["status"] == "confirmed") {
++				return
++			}
++			time.Sleep(100 * time.Millisecond)
++		}
++		t.Fatal("local enforcement intent did not reach expected state")
++	}
++	echo, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer echo.Close()
++	go func() {
++		for {
++			conn, err := echo.Accept()
++			if err != nil {
++				return
++			}
++			go func() { defer conn.Close(); _, _ = io.Copy(conn, conn) }()
++		}
++	}()
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := listener.Addr().(*net.TCPAddr).Port
++	listener.Close()
++	info := &panel.NodeInfo{Id: 1, Type: "vless", Tag: "local-enforcement", Common: &panel.CommonNode{
++		Protocol: "vless", ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp"}}
++	// Xray 26.9.30 blocks private destinations by default. Grant only the
++	// loopback echo endpoint in this isolated test; production keeps defaults.
++	localOutbound := fmt.Sprintf(`{"tag":"isolated-echo","protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.1/32"],"port":"%d"}]}}`, echo.Addr().(*net.TCPAddr).Port)
++	info.Common.Routes = []panel.Route{{Id: 1, Action: "route_ip", Match: []string{"127.0.0.1/32"}, ActionValue: &localOutbound}}
++	config := conf.New()
++	config.LogConfig.Level = "none"
++	server := core.New(config)
++	if err = server.Start([]*panel.NodeInfo{info}); err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	if err = server.AddNode(info.Tag, info); err != nil {
++		t.Fatal(err)
++	}
++	api, err := panel.New(&conf.NodeConfig{APIHost: panelURL, NodeID: 1, Key: "local-enforcement-test", Timeout: 2})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.Background()
++	users, err := api.GetUserList(ctx)
++	if err != nil || len(users) != 1 {
++		t.Fatalf("initial users: %d, %v", len(users), err)
++	}
++	limiter.Init()
++	c := NewController(api, &conf.NodeConfig{}, info)
++	c.server = server
++	c.tag = info.Tag
++	c.userList = users
++	c.limiter = limiter.AddLimiter("vless", info.Tag, users, map[int]int{})
++	defer limiter.DeleteLimiter(info.Tag)
++	if _, err = server.AddUsers(&core.AddUsersParams{Tag: info.Tag, NodeInfo: info, Users: users}); err != nil {
++		t.Fatal(err)
++	}
++	dial := func() (net.Conn, error) {
++		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
++		if err != nil {
++			return nil, err
++		}
++		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
++		id, _ := hex.DecodeString("11111111111141118111111111111111")
++		hello := append([]byte{0}, id...)
++		hello = append(hello, 0, 1)
++		hello = binary.BigEndian.AppendUint16(hello, uint16(echo.Addr().(*net.TCPAddr).Port))
++		hello = append(hello, 1, 127, 0, 0, 1)
++		hello = append(hello, []byte("ping")...)
++		if _, err = conn.Write(hello); err != nil {
++			conn.Close()
++			return nil, err
++		}
++		var header [2]byte
++		if _, err = io.ReadFull(conn, header[:]); err != nil {
++			conn.Close()
++			return nil, err
++		}
++		if header[0] != 0 || header[1] != 0 {
++			conn.Close()
++			return nil, fmt.Errorf("unexpected local VLESS response")
++		}
++		payload := make([]byte, 4)
++		if _, err = io.ReadFull(conn, payload); err != nil {
++			conn.Close()
++			return nil, err
++		}
++		if string(payload) != "ping" {
++			conn.Close()
++			return nil, fmt.Errorf("echo mismatch")
++		}
++		return conn, nil
++	}
++	live, err := dial()
++	if err != nil {
++		t.Fatalf("initial connection: %v", err)
++	}
++	defer live.Close()
++	request("POST", "/api/v1/subcore/webhooks/audit", map[string]any{"events": []any{map[string]any{
++		"event_id": "isolated-enforcement-e2e-0001", "user_id": 101, "node_id": 1, "rule_id": 920002, "violation_type": "block", "occurred_at": time.Now().UTC().Format(time.RFC3339Nano)}}})
++	waitIntent(1, false)
++	// A lost execution receipt must be retried without reviving the user or
++	// treating HTTP delivery as proof that the connection was closed.
++	fault, faultError := http.Post(panelURL+"/test/fail-next-ack", "application/json", bytes.NewBufferString("{}"))
++	if faultError != nil {
++		t.Fatal(faultError)
++	}
++	fault.Body.Close()
++	if fault.StatusCode != 200 {
++		t.Fatal("local fault injection failed")
++	}
++	if err = c.pullAccountRestrictions(ctx); err == nil {
++		t.Fatal("lost execution receipt was incorrectly treated as confirmed")
++	}
++	users, err = api.GetUserList(ctx)
++	if err != nil || users == nil || len(users) != 0 {
++		t.Fatalf("ban payload must be explicit empty list: %v %v", users, err)
++	}
++	if err = c.applyAccountUsers(ctx, users); err != nil {
++		t.Fatal(err)
++	}
++	_ = live.SetReadDeadline(time.Now().Add(2 * time.Second))
++	var b [1]byte
++	_, err = live.Read(b[:])
++	if err == nil {
++		t.Fatal("existing connection survived ban")
++	}
++	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
++		t.Fatal("existing connection was not closed")
++	}
++	if conn, err := dial(); err == nil {
++		conn.Close()
++		t.Fatal("banned identity opened a new connection")
++	}
++	if err = c.pullAccountRestrictions(ctx); err != nil {
++		t.Fatal("receipt retry failed", err)
++	}
++	waitIntent(1, true)
++	records := request("GET", "/api/v1/admin/abuse-records?user_id=101", nil)
++	items, ok := records["items"].([]any)
++	if !ok || len(items) != 1 {
++		t.Fatalf("expected one synthetic audit record: %v", records)
++	}
++	id := items[0].(map[string]any)["id"].(float64)
++	request("POST", fmt.Sprintf("/api/v1/admin/abuse-records/%.0f/unban", id), nil)
++	waitIntent(2, false)
++	if err = c.pullAccountRestrictions(ctx); err != nil {
++		t.Fatal(err)
++	}
++	users, err = api.GetUserList(ctx)
++	if err != nil || len(users) != 1 {
++		t.Fatalf("released snapshot: %v %v", users, err)
++	}
++	if err = c.applyAccountUsers(ctx, users); err != nil {
++		t.Fatal(err)
++	}
++	restored, err := dial()
++	if err != nil {
++		t.Fatalf("released identity failed to reconnect: %v", err)
++	}
++	restored.Close()
++	waitIntent(2, true)
++	t.Log("real Commerce audit -> NodePulse -> VLESS: live connection closed, new access denied, release reconnected")
++}
+diff --git a/core/app/dispatcher/account_enforcement_test.go b/core/app/dispatcher/account_enforcement_test.go
+new file mode 100644
+--- /dev/null
++++ b/core/app/dispatcher/account_enforcement_test.go
+@@ -0,0 +1,93 @@
++package dispatcher
++
++import (
++	"context"
++	"github.com/xtls/xray-core/common/buf"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestTransportStaysTrackedAfterWriterHalfClose(t *testing.T) {
++	manager := &LinkManager{}
++	server, client := net.Pipe()
++	defer client.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	if !manager.TrackConnection(ctx, server) {
++		t.Fatal("transport rejected")
++	}
++	connection := &accountConnection{server}
++	writer := &ManagedWriter{writer: connection, manager: manager}
++	if !manager.AddLink(writer, connection) {
++		t.Fatal("link rejected")
++	}
++	// A protocol half-close removes its writer, but the authenticated transport
++	// still has a live direction and must remain eligible for forced cleanup.
++	manager.RemoveWriter(writer)
++	if err := manager.CloseAll(); err != nil {
++		t.Fatal(err)
++	}
++	_ = client.SetReadDeadline(time.Now().Add(time.Second))
++	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
++		t.Fatal("transport survived cleanup", err)
++	}
++}
++
++type accountConnection struct{ net.Conn }
++
++func (c *accountConnection) WriteMultiBuffer(value buf.MultiBuffer) error { return nil }
++func (c *accountConnection) ReadMultiBuffer() (buf.MultiBuffer, error)    { return nil, io.EOF }
++func (c *accountConnection) Interrupt()                                   { _ = c.Close() }
++
++func TestAccountRevocationClosesExistingConnectionsWithoutReentrantLock(t *testing.T) {
++	manager := &LinkManager{links: make(map[*ManagedWriter]buf.Reader)}
++	server, client := net.Pipe()
++	defer client.Close()
++	connection := &accountConnection{server}
++	writer := &ManagedWriter{writer: connection, manager: manager}
++	if !manager.AddLink(writer, connection) {
++		t.Fatal("initial link rejected")
++	}
++	done := make(chan error, 1)
++	go func() { done <- manager.CloseAll() }()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("revocation deadlocked while closing a managed writer")
++	}
++	_ = client.SetReadDeadline(time.Now().Add(time.Second))
++	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
++		t.Fatalf("existing connection survived revocation: %v", err)
++	}
++	if err := manager.CloseAll(); err != nil {
++		t.Fatal("repeated revocation not idempotent", err)
++	}
++	lateServer, lateClient := net.Pipe()
++	defer lateClient.Close()
++	late := &accountConnection{lateServer}
++	if manager.AddLink(&ManagedWriter{writer: late, manager: manager}, late) {
++		t.Fatal("late authenticated connection escaped closed manager")
++	}
++}
++
++func TestDeniedAccountRequiresExplicitRelease(t *testing.T) {
++	dispatcher := &DefaultDispatcher{}
++	if err := dispatcher.DenyUser("test|account"); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := dispatcher.DeniedUsers.Load("test|account"); !ok {
++		t.Fatal("account admission guard missing")
++	}
++	dispatcher.AllowUser("test|account")
++	if _, ok := dispatcher.DeniedUsers.Load("test|account"); ok {
++		t.Fatal("release did not restore admission")
++	}
++	if _, ok := dispatcher.LinkManagers.Load("test|account"); ok {
++		t.Fatal("release retained the closed connection manager")
++	}
++}
+diff --git a/core/account_enforcement_test.go b/core/account_enforcement_test.go
+new file mode 100644
+--- /dev/null
++++ b/core/account_enforcement_test.go
+@@ -0,0 +1,98 @@
++package core
++
++import (
++	"context"
++	"encoding/json"
++	"net"
++	"testing"
++
++	panel "github.com/wyx2685/v2node/api/v2board"
++	"github.com/wyx2685/v2node/conf"
++)
++
++func TestAccountRevokeCoversBothXHTTPInboundsAndRetryAfterRebuild(t *testing.T) {
++	first, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	second, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		first.Close()
++		t.Fatal(err)
++	}
++	primaryPort, downloadPort := first.Addr().(*net.TCPAddr).Port, second.Addr().(*net.TCPAddr).Port
++	first.Close()
++	second.Close()
++	info := &panel.NodeInfo{Type: "vless", Tag: "isolated-revoke", Common: &panel.CommonNode{
++		ListenIP: "127.0.0.1", ServerPort: primaryPort, Network: "xhttp", NetworkSettings: json.RawMessage(`{"path":"/isolated-revoke","mode":"auto"}`),
++		XHTTPDownloadInbound: &panel.XHTTPDownloadInbound{ListenIP: "127.0.0.1", ServerPort: downloadPort, Network: "xhttp"}}}
++	config := conf.New()
++	config.LogConfig.Level = "none"
++	server := New(config)
++	if err = server.Start([]*panel.NodeInfo{info}); err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	if err = server.AddNode(info.Tag, info); err != nil {
++		t.Fatal(err)
++	}
++	users := []panel.UserInfo{{Id: 101, Uuid: "11111111-1111-4111-8111-111111111111"}}
++	params := &AddUsersParams{Tag: info.Tag, NodeInfo: info, Users: users}
++	checkCount := func(expected int64) {
++		t.Helper()
++		for _, tag := range []string{info.Tag, XHTTPDownloadTag(info.Tag)} {
++			manager, err := server.GetUserManager(tag)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got := manager.GetUsersCount(context.Background()); got != expected {
++				t.Fatalf("%s users=%d want %d", tag, got, expected)
++			}
++		}
++	}
++	if _, err = server.AddUsers(params); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = server.AddUsers(params); err != nil {
++		t.Fatal(err)
++	}
++	checkCount(1)
++	for range 2 {
++		if _, err = server.RevokeUserID(101, info.Tag, info); err != nil {
++			t.Fatal(err)
++		}
++	}
++	checkCount(0)
++	if _, err = server.AddUsers(params); err != nil {
++		t.Fatal(err)
++	}
++	checkCount(1)
++	// One listener disappears during cleanup: deny the other immediately, retain
++	// the failed operation, then finish idempotently after the listener returns.
++	if err = server.removeInbound(XHTTPDownloadTag(info.Tag)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = server.RevokeUserID(101, info.Tag, info); err == nil {
++		t.Fatal("missing listener reported success")
++	}
++	manager, _ := server.GetUserManager(info.Tag)
++	if manager.GetUsersCount(context.Background()) != 0 {
++		t.Fatal("primary credential survived partial failure")
++	}
++	download, _ := xhttpDownloadNodeInfo(info)
++	inbound, err := buildInbound(download, XHTTPDownloadTag(info.Tag))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = server.addInbound(inbound); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = server.RevokeUserID(101, info.Tag, info); err != nil {
++		t.Fatal("retry after rebuild", err)
++	}
++	checkCount(0)
++	if _, err = server.AddUsers(params); err != nil {
++		t.Fatal(err)
++	}
++	checkCount(1)
++}
