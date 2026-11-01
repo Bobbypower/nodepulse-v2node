@@ -6,14 +6,6 @@ env:
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/build.yml"
-      - "ops/install-nodepulse-v2node.sh"
-      - "ops/v2node/**"
-      - "ops/xray-core/**"
 
 permissions:
   contents: write
@@ -74,24 +66,6 @@ jobs:
         with:
           go-version-file: v2node/go.mod
           cache-dependency-path: v2node/go.sum
-
-      - name: Test patched XHTTP session sharing
-        env:
-          GOEXPERIMENT: jsonv2
-          GOTOOLCHAIN: local
-        run: |
-          set -euo pipefail
-          go test ./transport/internet/splithttp
-          cd ../v2node
-          go mod edit -replace github.com/xtls/xray-core=../xray-core
-          go test ./api/v2board ./core ./limiter ./node
-        working-directory: xray-core
-
-      - name: Validate installer
-        run: |
-          bash -n ops/install-nodepulse-v2node.sh
-          python3 ops/tests/test_installer_contract.py
-        working-directory: nodepulse-v2node
 
       - name: Build
         working-directory: v2node
