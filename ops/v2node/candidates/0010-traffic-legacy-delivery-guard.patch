@@ -1,0 +1,189 @@
+diff --git a/api/v2board/user.go b/api/v2board/user.go
+--- a/api/v2board/user.go
++++ b/api/v2board/user.go
+@@ -9,6 +9,7 @@
+ 
+ 	"encoding/json/v2"
+ 	"io"
+ 
++	"github.com/go-resty/resty/v2"
+ 	"github.com/vmihailenco/msgpack/v5"
+ )
+@@ -148,13 +149,30 @@
+ 		data[userTraffic[i].UID] = []int64{userTraffic[i].Upload, userTraffic[i].Download}
+ 	}
+ 	const path = "/api/v1/server/UniProxy/push"
+-	_, err := c.client.R().
++	// Legacy UniProxy has no batch identifier. A failed request may have
++	// reached the billing transaction, so do not use Resty's transport retry.
++	response, err := c.client.R().
+ 		SetContext(ctx).
++		AddRetryCondition(func(*resty.Response, error) bool { return false }).
+ 		SetBody(data).
+ 		ForceContentType("application/json").
+ 		Post(path)
+ 	if err != nil {
+-		return err
++		switch {
++		case errors.Is(err, context.Canceled):
++			return fmt.Errorf("traffic report outcome unknown: %w", context.Canceled)
++		case errors.Is(err, context.DeadlineExceeded):
++			return fmt.Errorf("traffic report outcome unknown: %w", context.DeadlineExceeded)
++		default:
++			// The underlying transport error can contain the node token.
++			return errors.New("traffic report transport failed: outcome unknown")
++		}
++	}
++	if response == nil {
++		return errors.New("traffic report received no response: outcome unknown")
++	}
++	if status := response.StatusCode(); status < 200 || status >= 300 {
++		return fmt.Errorf("traffic report did not receive success: HTTP %d", status)
+ 	}
+ 	return nil
+ }
+diff --git a/core/user.go b/core/user.go
+--- a/core/user.go
++++ b/core/user.go
+@@ -152,16 +152,25 @@
+ 		if total.Upload+total.Download <= int64(mintraffic*1000) {
+ 			continue
+ 		}
+-		for _, traffic := range storages[uid] {
+-			traffic.UpCounter.Store(0)
+-			traffic.DownCounter.Store(0)
+-		}
+-		trafficSlice = append(trafficSlice, *total)
++		// The loads above decide eligibility only. Each atomic swap returns
++		// the exact increment it removed, including traffic since those loads.
++		total.Upload, total.Download = drainReportCounters(storages[uid])
++		if total.Upload != 0 || total.Download != 0 {
++			trafficSlice = append(trafficSlice, *total)
++		}
+ 	}
+ 	if len(trafficSlice) == 0 {
+ 		return nil, nil
+ 	}
+ 	return trafficSlice, nil
++}
++
++func drainReportCounters(storages []*counter.TrafficStorage) (upload, download int64) {
++	for _, traffic := range storages {
++		upload += traffic.UpCounter.Swap(0)
++		download += traffic.DownCounter.Swap(0)
++	}
++	return upload, download
+ }
+ 
+ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
+diff --git a/api/v2board/traffic_delivery_test.go b/api/v2board/traffic_delivery_test.go
+new file mode 100644
+--- /dev/null
++++ b/api/v2board/traffic_delivery_test.go
+@@ -0,0 +1,71 @@
++package panel
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/go-resty/resty/v2"
++)
++
++type trafficTestTransport func(*http.Request) (*http.Response, error)
++
++func (fn trafficTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
++	return fn(request)
++}
++
++func TestLegacyTrafficReportDoesNotReplayUnknownOutcome(t *testing.T) {
++	for _, test := range []struct {
++		name    string
++		status  int
++		failure error
++		want    string
++	}{
++		{name: "accepted", status: http.StatusOK},
++		{name: "rejected", status: http.StatusServiceUnavailable, want: "HTTP 503"},
++		{name: "ack lost after receipt", failure: io.ErrUnexpectedEOF, want: "outcome unknown"},
++		{name: "timed out after receipt", failure: context.DeadlineExceeded, want: "context deadline exceeded"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			calls := 0
++			client := resty.New().SetRetryCount(3).SetBaseURL("http://nodepulse.invalid").SetQueryParam("token", "synthetic-secret")
++			client.SetTransport(trafficTestTransport(func(req *http.Request) (*http.Response, error) {
++				calls++
++				if req.URL.Path != "/api/v1/server/UniProxy/push" || req.Method != http.MethodPost {
++					t.Fatalf("unexpected endpoint: %s %s", req.Method, req.URL.Path)
++				}
++				var data map[int][]int64
++				if err := json.NewDecoder(req.Body).Decode(&data); err != nil {
++					t.Fatal(err)
++				}
++				if got := data[8]; len(got) != 2 || got[0] != 12 || got[1] != 20 {
++					t.Fatalf("legacy directional payload changed: %v", got)
++				}
++				if test.failure != nil {
++					return nil, test.failure
++				}
++				return &http.Response{StatusCode: test.status, Status: fmt.Sprint(test.status), Header: http.Header{},
++					Body: io.NopCloser(strings.NewReader("{}")), Request: req}, nil
++			}))
++			err := (&Client{client: client}).ReportUserTraffic(context.Background(),
++				[]UserTraffic{{UID: 8, Upload: 12, Download: 20}})
++			if calls != 1 {
++				t.Fatalf("billing POST attempts=%d, want 1", calls)
++			}
++			if test.want == "" && err != nil || test.want != "" && (err == nil || !strings.Contains(err.Error(), test.want)) {
++				t.Fatalf("result=%v, want %q", err, test.want)
++			}
++			if err != nil && strings.Contains(err.Error(), "synthetic-secret") {
++				t.Fatal("traffic report exposed the authentication token")
++			}
++			if test.failure == context.DeadlineExceeded && !errors.Is(err, context.DeadlineExceeded) {
++				t.Fatalf("timeout was not propagated: %v", err)
++			}
++		})
++	}
++}
+diff --git a/core/traffic_counters_test.go b/core/traffic_counters_test.go
+new file mode 100644
+--- /dev/null
++++ b/core/traffic_counters_test.go
+@@ -0,0 +1,30 @@
++package core
++
++import (
++	"testing"
++
++	"github.com/wyx2685/v2node/common/counter"
++)
++
++func TestDrainReportCountersIncludesLateBytesAndDoesNotResend(t *testing.T) {
++	uplink, downlink := &counter.TrafficStorage{}, &counter.TrafficStorage{}
++	uplink.UpCounter.Add(12)
++	downlink.DownCounter.Add(20)
++	if uplink.UpCounter.Load()+downlink.DownCounter.Load() != 32 {
++		t.Fatal("unexpected threshold sample")
++	}
++	uplink.UpCounter.Add(3)
++	downlink.DownCounter.Add(5)
++	storages := []*counter.TrafficStorage{uplink, downlink}
++	if up, down := drainReportCounters(storages); up != 15 || down != 25 {
++		t.Fatalf("drained (%d,%d), want (15,25)", up, down)
++	}
++	uplink.UpCounter.Add(7)
++	downlink.DownCounter.Add(9)
++	if up, down := drainReportCounters(storages); up != 7 || down != 9 {
++		t.Fatalf("next batch (%d,%d), want (7,9)", up, down)
++	}
++	if up, down := drainReportCounters(storages); up != 0 || down != 0 {
++		t.Fatalf("previous bytes appeared again: (%d,%d)", up, down)
++	}
++}

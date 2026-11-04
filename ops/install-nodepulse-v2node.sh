@@ -11,6 +11,12 @@ VERIFY_SECONDS="${VERIFY_SECONDS:-10}"
 JOURNAL_VACUUM_SIZE="${JOURNAL_VACUUM_SIZE:-500M}"
 ALLOW_UNVERIFIED_BINARY="${ALLOW_UNVERIFIED_BINARY:-0}"
 ALLOW_SHARED_BINARY_UPDATE="${ALLOW_SHARED_BINARY_UPDATE:-0}"
+EDGE_GATEWAY_PACKAGE_SHA256="${EDGE_GATEWAY_PACKAGE_SHA256:-}"
+ISOLATED_RUNTIME="${ISOLATED_RUNTIME:-0}"
+DEFER_START="${DEFER_START:-0}"
+CERTIFICATE_PROFILE_ID="${CERTIFICATE_PROFILE_ID:-}"
+CERTIFICATE_REQUEST_ID="${CERTIFICATE_REQUEST_ID:-}"
+BOOTSTRAP_BINDING_SHA256="${BOOTSTRAP_BINDING_SHA256:-}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "This installer must run as root." >&2
@@ -37,7 +43,25 @@ if ! [[ "${VERIFY_SECONDS}" =~ ^[0-9]+$ ]] || [ "${VERIFY_SECONDS}" -lt 1 ]; the
   exit 2
 fi
 
-for command_name in systemctl sha256sum ss flock; do
+if ! [[ "${ISOLATED_RUNTIME}" =~ ^[01]$ ]] || ! [[ "${DEFER_START}" =~ ^[01]$ ]] || \
+   { [ "${DEFER_START}" = "1" ] && [ "${ISOLATED_RUNTIME}" != "1" ]; }; then
+  echo "Deferred bootstrap requires a verified isolated runtime." >&2
+  exit 2
+fi
+
+if [ "${ISOLATED_RUNTIME}" = "1" ]; then
+  if ! [[ "${CERTIFICATE_PROFILE_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$ ]] || \
+     ! [[ "${CERTIFICATE_REQUEST_ID}" =~ ^[A-Za-z0-9_-]{8,80}$ ]]; then
+    echo "Bootstrap preparation and activation requires stable certificate profile and request IDs." >&2
+    exit 2
+  fi
+  if [ "${DEFER_START}" = "0" ] && ! [[ "${BOOTSTRAP_BINDING_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "Bootstrap activation requires the exact prepared binding SHA-256." >&2
+    exit 2
+  fi
+fi
+
+for command_name in systemctl sha256sum ss flock python3; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Missing required command: ${command_name}" >&2
     exit 2
@@ -51,15 +75,6 @@ if ! flock -n 9; then
   echo "Another NodePulse v2node deployment is already running on this host." >&2
   exit 75
 fi
-if command -v jq >/dev/null 2>&1; then
-  JSON_PARSER="jq"
-elif command -v python3 >/dev/null 2>&1; then
-  JSON_PARSER="python3"
-else
-  echo "Missing JSON parser: install jq or python3." >&2
-  exit 2
-fi
-
 DOCKER_CONTAINER="v2node-${NODE_ID}"
 SERVICE_NAME="v2node-${NODE_ID}"
 SERVICE_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -96,28 +111,47 @@ download_file() {
 fetch_panel_json() {
   local endpoint="$1"
   local output="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSLG -o "${output}" "${NODEPULSE_URL%/}${endpoint}" \
-      --data-urlencode "node_type=v2node" \
-      --data-urlencode "node_id=${NODE_ID}" \
-      --data-urlencode "token=${NODEPULSE_TOKEN}"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q --https-only -O "${output}" \
-      "${NODEPULSE_URL%/}${endpoint}?node_type=v2node&node_id=${NODE_ID}&token=${NODEPULSE_TOKEN}"
-  else
-    echo "Neither curl nor wget is installed." >&2
-    return 1
-  fi
+  NODEPULSE_FETCH_TOKEN="${NODEPULSE_TOKEN}" python3 -I - "${endpoint}" "${output}" "${NODE_ID}" "${NODEPULSE_URL}" "${ISOLATED_RUNTIME}" <<'PY'
+import json, os, sys
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs): return None
+try:
+    endpoint, output, node, base, isolated = sys.argv[1:]
+    parsed = urlsplit(base)
+    assert endpoint in {'/api/v2/server/config','/api/v2/server/local_config'}
+    assert parsed.scheme in ({'https'} if isolated=='1' else {'http','https'}) and parsed.netloc
+    assert not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+    token = os.environ.pop('NODEPULSE_FETCH_TOKEN')
+    url = base.rstrip('/') + endpoint + '?' + urlencode({'node_type':'v2node','node_id':node,'token':token})
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    with opener.open(Request(url), timeout=30) as response:
+        assert response.status==200
+        raw=response.read(4*1024*1024+1)
+    assert len(raw)<=4*1024*1024 and isinstance(json.loads(raw),dict)
+    with open(output,'xb') as target:
+        os.fchmod(target.fileno(),0o600)
+        target.write(raw)
+except Exception:
+    print('node_config_fetch_failed',file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
-port_is_listening() {
-  local transport="$1"
-  local port="$2"
-  case "${transport}" in
-    tcp) ss -ltnH ;;
-    udp) ss -lunH ;;
-    *) return 2 ;;
-  esac | awk '{print $4}' | grep -Eq "(:|\\])${port}$"
+runtime_check() {
+  python3 -I -c 'import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module("edge_gateway.node_listener",run_name="__main__")' \
+    "${TMP_DIR}/runtime" "$@" --binary "${BINARY_PATH}"
+}
+
+bootstrap_check() {
+  python3 -I -c 'import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module("edge_gateway.node_bootstrap",run_name="__main__")' \
+    "${TMP_DIR}/runtime" "$@"
+}
+
+verify_owned_listeners() {
+  runtime_check verify --node "${NODE_ID}" --server "${TMP_SERVER_CONFIG}" --local "${TMP_LOCAL_CONFIG}" --requested-port "${NODE_PORT}" >/dev/null
 }
 
 TMP_DIR="$(mktemp -d)"
@@ -166,7 +200,9 @@ rollback_runtime() {
   echo "Deployment failed; restoring the previous v2node runtime." >&2
   set +e
   systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1
-  restore_path "${HAD_BINARY}" "v2node" "${BINARY_PATH}"
+  if [ "${ISOLATED_RUNTIME}" != "1" ]; then
+    restore_path "${HAD_BINARY}" "v2node" "${BINARY_PATH}"
+  fi
   restore_path "${HAD_CONFIG}" "v2node-${NODE_ID}.json" "${CONFIG_PATH}"
   restore_path "${HAD_UNIT}" "${SERVICE_NAME}.service" "${SERVICE_UNIT}"
   systemctl daemon-reload
@@ -204,7 +240,7 @@ other_units="$(
     | awk '{print $1}' \
     | grep -Fvx "${SERVICE_NAME}.service" || true
 )"
-if [ -n "${other_units}" ] && [ "${ALLOW_SHARED_BINARY_UPDATE}" != "1" ]; then
+if [ "${ISOLATED_RUNTIME}" != "1" ] && [ -n "${other_units}" ] && [ "${ALLOW_SHARED_BINARY_UPDATE}" != "1" ]; then
   echo "Other v2node systemd units share ${BINARY_PATH}:" >&2
   printf '%s\n' "${other_units}" >&2
   echo "Deploy each node independently or set ALLOW_SHARED_BINARY_UPDATE=1 after reviewing impact." >&2
@@ -246,142 +282,62 @@ if [ -n "${expected_sha256}" ]; then
 else
   echo "WARNING: installing an unverified v2node binary by explicit override." >&2
 fi
+if [ "${ISOLATED_RUNTIME}" = "1" ]; then
+  if ! [[ "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "An isolated runtime requires a verified release SHA-256." >&2
+    exit 2
+  fi
+  BINARY_PATH="/usr/local/lib/nodepulse/v2node/${expected_sha256}/v2node"
+fi
 chmod 0755 "${TMP_BIN}"
-echo "Downloaded version: $("${TMP_BIN}" version 2>&1 | head -n 1)"
+if ! candidate_version="$("${TMP_BIN}" version 2>&1)"; then
+  echo "Candidate binary cannot execute; check architecture and use an executable TMPDIR. The existing runtime was not touched." >&2
+  exit 2
+fi
+echo "Downloaded version: ${candidate_version%%$'\n'*}"
 
 echo "Fetching local and server runtime configuration from NodePulse."
 fetch_panel_json "/api/v2/server/local_config" "${TMP_LOCAL_CONFIG}"
 fetch_panel_json "/api/v2/server/config" "${TMP_SERVER_CONFIG}"
 
-if [ "${JSON_PARSER}" = "jq" ]; then
-  jq -e . "${TMP_LOCAL_CONFIG}" >/dev/null
-  read -r -d '' JQ_SERVER_CONFIG_FILTER <<'JQ' || true
-def number_or_null:
-  if type == "number" then
-    .
-  elif type == "string" then
-    (try tonumber catch null)
-  else
-    null
-  end;
-
-. as $config
-| ($requested_port | tonumber) as $requested
-| if $config.status == "fail" then
-    error("NodePulse server config failed: \($config.message // "unknown error")")
-  else
-    .
-  end
-| ($config.server_port | number_or_null) as $primary
-| if ($primary == null or $primary < 1 or $primary > 65535) then
-    error("NodePulse server config has no valid server_port")
-  elif ($requested != 0 and $requested != $primary) then
-    error("NODE_PORT=\($requested) does not match NodePulse server_port=\($primary)")
-  else
-    .
-  end
-| ($config.protocol // "" | tostring | ascii_downcase) as $protocol
-| ($config.network // "" | tostring | ascii_downcase) as $network
-| (($config.tls_settings.alpn // []) | if type == "array" then map(tostring | ascii_downcase) else [] end) as $alpn
-| (if ($protocol == "hysteria2" or $protocol == "tuic" or ((($network == "xhttp") or ($network == "splithttp")) and $alpn == ["h3"])) then "udp" else "tcp" end) as $primary_transport
-| if (($config.xhttp_download_inbound | type) == "object") then
-    if (($config.network // "" | tostring | ascii_downcase) != "xhttp") then
-      error("xhttp_download_inbound requires the primary network to be xhttp")
-    elif (($config.xhttp_download_inbound.network // "xhttp" | tostring | ascii_downcase) != "xhttp") then
-      error("xhttp_download_inbound.network must be xhttp")
-    elif (($config.xhttp_download_inbound.security // "none" | tostring | ascii_downcase) != "none") then
-      error("xhttp_download_inbound.security must be none")
-    else
-      .
-    end
-    | ($config.xhttp_download_inbound.server_port | number_or_null) as $download
-    | if ($download == null or $download < 1 or $download > 65535) then
-        error("xhttp_download_inbound has no valid server_port")
-      else
-        .
-      end
-    | ($config.network_settings.path // "/" | tostring) as $main_path
-    | ($config.xhttp_download_inbound.network_settings.path // $main_path | tostring) as $download_path
-    | if ($main_path != $download_path) then
-      error("XHTTP upload and download inbounds must use the same normalized path")
-      else
-        if ($primary == $download and $primary_transport == "tcp") then
-          "tcp:\($primary)"
-        else
-          "\($primary_transport):\($primary)", "tcp:\($download)"
-        end
-      end
-  else
-    "\($primary_transport):\($primary)"
-  end
-JQ
-  jq -er --arg requested_port "${NODE_PORT}" "${JQ_SERVER_CONFIG_FILTER}" \
-    "${TMP_SERVER_CONFIG}" >"${TMP_EXPECTED_ENDPOINTS}"
-else
-  python3 -m json.tool "${TMP_LOCAL_CONFIG}" >/dev/null
-  python3 - "${TMP_SERVER_CONFIG}" "${NODE_PORT}" >"${TMP_EXPECTED_ENDPOINTS}" <<'PY'
-import json
-import sys
-
-config_path, requested_port = sys.argv[1], int(sys.argv[2])
-with open(config_path, "r", encoding="utf-8") as handle:
-    config = json.load(handle)
-
-if config.get("status") == "fail":
-    raise SystemExit(f"NodePulse server config failed: {config.get('message', 'unknown error')}")
-
-try:
-    primary_port = int(config.get("server_port") or 0)
-except (TypeError, ValueError):
-    primary_port = 0
-if not 1 <= primary_port <= 65535:
-    raise SystemExit("NodePulse server config has no valid server_port")
-if requested_port and requested_port != primary_port:
-    raise SystemExit(
-        f"NODE_PORT={requested_port} does not match NodePulse server_port={primary_port}"
-    )
-
-protocol = str(config.get("protocol") or "").lower()
-network = str(config.get("network") or "").lower()
-tls_settings = config.get("tls_settings") or {}
-alpn = tls_settings.get("alpn") if isinstance(tls_settings, dict) else []
-alpn = [str(item).lower() for item in alpn] if isinstance(alpn, list) else []
-primary_transport = (
-    "udp"
-    if protocol in {"hysteria2", "tuic"}
-    or (network in {"xhttp", "splithttp"} and alpn == ["h3"])
-    else "tcp"
-)
-endpoints = [f"{primary_transport}:{primary_port}"]
-download = config.get("xhttp_download_inbound")
-if isinstance(download, dict):
-    if str(config.get("network") or "").lower() != "xhttp":
-        raise SystemExit("xhttp_download_inbound requires the primary network to be xhttp")
-    if str(download.get("network") or "xhttp").lower() != "xhttp":
-        raise SystemExit("xhttp_download_inbound.network must be xhttp")
-    if str(download.get("security") or "none").lower() != "none":
-        raise SystemExit("xhttp_download_inbound.security must be none")
-    try:
-        download_port = int(download.get("server_port") or 0)
-    except (TypeError, ValueError):
-        download_port = 0
-    if not 1 <= download_port <= 65535:
-        raise SystemExit("xhttp_download_inbound has no valid server_port")
-
-    main_settings = config.get("network_settings") or {}
-    download_settings = download.get("network_settings") or {}
-    main_path = str(main_settings.get("path") or "/")
-    download_path = str(download_settings.get("path") or main_path)
-    if main_path != download_path:
-        raise SystemExit(
-            "XHTTP upload and download inbounds must use the same normalized path"
-        )
-    endpoints.append(f"tcp:{download_port}")
-
-for endpoint in dict.fromkeys(endpoints):
-    print(endpoint)
-PY
+# The helper is part of this release and is verified before touching a runtime.
+download_file "${V2NODE_RELEASE_BASE%/}/nodepulse-edge-gateway.tar.gz" "${TMP_DIR}/runtime.tar.gz"
+if [ -z "${EDGE_GATEWAY_PACKAGE_SHA256}" ]; then
+  if [ ! -f "${TMP_CHECKSUMS}" ]; then
+    download_file "${V2NODE_RELEASE_BASE%/}/SHA256SUMS" "${TMP_CHECKSUMS}"
+  fi
+  EDGE_GATEWAY_PACKAGE_SHA256="$(awk '$2 == "nodepulse-edge-gateway.tar.gz" {print $1; exit}' "${TMP_CHECKSUMS}")"
 fi
+if ! [[ "${EDGE_GATEWAY_PACKAGE_SHA256}" =~ ^[0-9a-f]{64}$ ]] || \
+  [ "$(sha256sum "${TMP_DIR}/runtime.tar.gz" | awk '{print $1}')" != "${EDGE_GATEWAY_PACKAGE_SHA256}" ]; then
+  echo "Runtime helper checksum missing or mismatched; the existing runtime was not touched." >&2
+  exit 2
+fi
+python3 -I - "${TMP_DIR}/runtime.tar.gz" "${TMP_DIR}/runtime" <<'PY'
+from pathlib import Path
+import sys, tarfile
+target = Path(sys.argv[2])
+with tarfile.open(sys.argv[1]) as archive:
+    members = archive.getmembers()
+    assert len(members) <= 32 and sum(item.size for item in members) <= 2 * 1024 * 1024
+    for item in members:
+        parts = Path(item.name).parts
+        assert len(parts) in {1, 2} and parts[0] == "edge_gateway" and ".." not in parts
+        assert (item.isdir() and len(parts) == 1) or (item.isfile() and len(parts) == 2 and parts[-1].endswith((".py", ".md")))
+    for item in members:
+        if item.isfile():
+            path = target / item.name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(archive.extractfile(item).read())
+PY
+if [ "${ISOLATED_RUNTIME}" = "1" ]; then
+  runtime_check prepare --node "${NODE_ID}" --server "${TMP_SERVER_CONFIG}" --local "${TMP_LOCAL_CONFIG}" \
+    --requested-port "${NODE_PORT}" >"${TMP_DIR}/pinned-local-config.json"
+  chmod 0600 "${TMP_DIR}/pinned-local-config.json"
+  mv -f -- "${TMP_DIR}/pinned-local-config.json" "${TMP_LOCAL_CONFIG}"
+fi
+runtime_check compile --node "${NODE_ID}" --server "${TMP_SERVER_CONFIG}" --local "${TMP_LOCAL_CONFIG}" \
+  --requested-port "${NODE_PORT}" >"${TMP_EXPECTED_ENDPOINTS}"
 
 mapfile -t EXPECTED_ENDPOINTS <"${TMP_EXPECTED_ENDPOINTS}"
 if [ "${#EXPECTED_ENDPOINTS[@]}" -eq 0 ]; then
@@ -401,7 +357,47 @@ if command -v docker >/dev/null 2>&1 && docker inspect "${DOCKER_CONTAINER}" >/d
   fi
 fi
 if systemctl is-active --quiet v2node.service 2>/dev/null; then
-  OLD_GENERIC_SERVICE_RUNNING=1
+  if runtime_check owned-generic --node "${NODE_ID}"; then
+    OLD_GENERIC_SERVICE_RUNNING=1
+  else
+    echo "Existing generic v2node service is not proven to belong to this node; refusing takeover." >&2
+    exit 2
+  fi
+fi
+if [ "${OLD_DOCKER_RUNNING}" = "1" ]; then
+  echo "Legacy Docker migration needs separate container/config ownership verification; refusing automatic takeover." >&2
+  exit 2
+fi
+if [ "${ISOLATED_RUNTIME}" = "1" ] && { [ "${OLD_SERVICE_ACTIVE}" = "1" ] || [ "${OLD_GENERIC_SERVICE_RUNNING}" = "1" ]; }; then
+  echo "Bootstrap only accepts an inactive target; reconcile an already running node instead of restarting it." >&2
+  exit 2
+fi
+runtime_check preflight --node "${NODE_ID}" --server "${TMP_SERVER_CONFIG}" --local "${TMP_LOCAL_CONFIG}" \
+  --requested-port "${NODE_PORT}" >/dev/null
+
+if [ "${ISOLATED_RUNTIME}" = "1" ]; then
+  bootstrap_phase=prepare
+  if [ "${DEFER_START}" = "0" ]; then bootstrap_phase=activate; fi
+  bootstrap_check reserve --node "${NODE_ID}" --binary "${BINARY_PATH}" \
+    --server "${TMP_SERVER_CONFIG}" --local "${TMP_LOCAL_CONFIG}" \
+    --profile-id "${CERTIFICATE_PROFILE_ID}" --request-id "${CERTIFICATE_REQUEST_ID}" \
+    --phase "${bootstrap_phase}" --binding-sha256 "${BOOTSTRAP_BINDING_SHA256}" --helper-sha256 "${EDGE_GATEWAY_PACKAGE_SHA256}"
+fi
+
+if [ "${ISOLATED_RUNTIME}" = "1" ] && [ "${DEFER_START}" = "0" ]; then
+  "${TMP_BIN}" certificate profile --profile-id "${CERTIFICATE_PROFILE_ID}" >"${TMP_DIR}/certificate-profile.json"
+  "${TMP_BIN}" certificate inspect --profile-id "${CERTIFICATE_PROFILE_ID}" >"${TMP_DIR}/certificate-inspect.json"
+  python3 -I - "${TMP_DIR}/certificate-profile.json" "${TMP_DIR}/certificate-inspect.json" "${TMP_SERVER_CONFIG}" "${CERTIFICATE_REQUEST_ID}" <<'PY'
+import json, sys
+from pathlib import Path
+profile, receipt, server = [json.loads(Path(value).read_bytes()) for value in sys.argv[1:4]]
+cert=server['cert_config']; tls=server['tls_settings']
+assert profile['runtime_uid']==0 and profile['runtime_uid_source']=='cli' and profile['service_uid_verified'] is False, 'certificate_cli_identity_mismatch'
+assert profile['domain']==tls['server_name'] and profile['cert_file']==cert['cert_file'] and profile['key_file']==cert['key_file'], 'certificate_target_mismatch'
+assert receipt['state']=='persisted' and receipt['generation_bound'] is True and receipt['request_id']==sys.argv[4], 'certificate_task_mismatch'
+assert receipt['profile_id']==profile['profile_id'] and receipt['profile_sha256']==profile['profile_sha256'] and receipt['runtime_uid']==0, 'certificate_profile_mismatch'
+assert receipt['tls_handshake_verified'] is False, 'unexpected_certificate_receipt'
+PY
 fi
 
 backup_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -424,8 +420,26 @@ echo "Previous runtime backup: ${BACKUP_DIR}"
 
 mkdir -p /etc/v2node /var/log/v2node
 CHANGES_STARTED=1
-atomic_install "${TMP_BIN}" "${BINARY_PATH}" 0755
-atomic_install "${TMP_LOCAL_CONFIG}" "${CONFIG_PATH}" 0600
+if [ "${ISOLATED_RUNTIME}" = "1" ]; then
+  python3 -I - "${BINARY_PATH}" "${expected_sha256}" <<'PY'
+import hashlib, os, stat, sys
+from pathlib import Path
+path=Path(sys.argv[1])
+for parent in [path.parent, *path.parent.parents]:
+    if parent.exists() or parent.is_symlink():
+        info=parent.lstat()
+        assert stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022, 'untrusted_runtime_directory'
+if path.exists() or path.is_symlink():
+    info=path.lstat()
+    assert stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022, 'untrusted_runtime_file'
+    assert hashlib.sha256(path.read_bytes()).hexdigest()==sys.argv[2], 'immutable_runtime_hash_mismatch'
+PY
+  if [ ! -f "${BINARY_PATH}" ]; then atomic_install "${TMP_BIN}" "${BINARY_PATH}" 0755; fi
+else
+  atomic_install "${TMP_BIN}" "${BINARY_PATH}" 0755
+fi
+if [ "${ISOLATED_RUNTIME}" != "1" ] || [ "${DEFER_START}" = "1" ]; then
+  atomic_install "${TMP_LOCAL_CONFIG}" "${CONFIG_PATH}" 0600
 
 TMP_SERVICE_UNIT="$(mktemp "$(dirname "${SERVICE_UNIT}")/.${SERVICE_NAME}.service.new.XXXXXX")"
 cat >"${TMP_SERVICE_UNIT}" <<EOF
@@ -436,9 +450,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
 ExecStart=${BINARY_PATH} server --config ${CONFIG_PATH} --watch=false
-Restart=always
+Restart=on-failure
 RestartSec=3
+KillMode=control-group
+TimeoutStopSec=30s
+SendSIGKILL=yes
 LimitNOFILE=1048576
 
 [Install]
@@ -447,16 +465,23 @@ EOF
 chmod 0644 "${TMP_SERVICE_UNIT}"
 mv -fT -- "${TMP_SERVICE_UNIT}" "${SERVICE_UNIT}"
 systemctl daemon-reload
-
-if [ "${OLD_DOCKER_RUNNING}" = "1" ]; then
-  docker stop "${DOCKER_CONTAINER}" >/dev/null
 fi
+
+if [ "${DEFER_START}" = "1" ]; then
+  systemctl disable "${SERVICE_NAME}.service" >/dev/null
+  bootstrap_check prepared --node "${NODE_ID}"
+  DEPLOY_COMMITTED=1
+  exit 0
+fi
+
 if [ "${OLD_GENERIC_SERVICE_RUNNING}" = "1" ]; then
   systemctl stop v2node.service
 fi
 
 systemctl enable "${SERVICE_NAME}.service" >/dev/null
-if ! systemctl restart "${SERVICE_NAME}.service"; then
+service_action=restart
+if [ "${ISOLATED_RUNTIME}" = "1" ]; then service_action=start; fi
+if ! systemctl "${service_action}" "${SERVICE_NAME}.service"; then
   systemctl status "${SERVICE_NAME}.service" --no-pager -l || true
   exit 1
 fi
@@ -465,14 +490,9 @@ restart_count="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value)"
 all_ports_ready=0
 for _ in $(seq 1 "${VERIFY_SECONDS}"); do
   all_ports_ready=1
-  for endpoint in "${EXPECTED_ENDPOINTS[@]}"; do
-    transport="${endpoint%%:*}"
-    port="${endpoint#*:}"
-    if ! port_is_listening "${transport}" "${port}"; then
-      all_ports_ready=0
-      break
-    fi
-  done
+  if ! verify_owned_listeners; then
+    all_ports_ready=0
+  fi
   if [ "${all_ports_ready}" = "1" ]; then
     break
   fi
@@ -492,16 +512,10 @@ if [ "${all_ports_ready}" != "1" ]; then
   journalctl -u "${SERVICE_NAME}.service" -n 120 --no-pager || true
   exit 1
 fi
-for endpoint in "${EXPECTED_ENDPOINTS[@]}"; do
-  transport="${endpoint%%:*}"
-  port="${endpoint#*:}"
-  if ! port_is_listening "${transport}" "${port}"; then
-    echo "${SERVICE_NAME} lost required listener ${endpoint} during verification." >&2
-    ss -lntupH || true
-    journalctl -u "${SERVICE_NAME}.service" -n 120 --no-pager || true
-    exit 1
-  fi
-done
+if ! verify_owned_listeners; then
+  echo "The required listeners are missing or belong to another process; refusing deployment success." >&2
+  exit 1
+fi
 current_restart_count="$(systemctl show "${SERVICE_NAME}.service" -p NRestarts --value)"
 if [ "${current_restart_count}" != "${restart_count}" ]; then
   echo "${SERVICE_NAME} restarted during verification (${restart_count} -> ${current_restart_count})." >&2
@@ -509,16 +523,16 @@ if [ "${current_restart_count}" != "${restart_count}" ]; then
   exit 1
 fi
 
-if command -v docker >/dev/null 2>&1 && docker inspect "${DOCKER_CONTAINER}" >/dev/null 2>&1; then
-  docker rm -f "${DOCKER_CONTAINER}" >/dev/null || true
-fi
 if [ "${OLD_GENERIC_SERVICE_RUNNING}" = "1" ]; then
   systemctl disable v2node.service >/dev/null 2>&1 || true
 fi
 
+if [ "${ISOLATED_RUNTIME}" = "1" ]; then
+  bootstrap_check activated --node "${NODE_ID}"
+  DEPLOY_COMMITTED=1
+  exit 0
+fi
 DEPLOY_COMMITTED=1
-journalctl --rotate || true
-journalctl --vacuum-size="${JOURNAL_VACUUM_SIZE}" || true
 systemctl status "${SERVICE_NAME}.service" --no-pager -l | sed -n '1,80p'
 echo "Verified listeners: ${EXPECTED_ENDPOINTS[*]}"
 echo "Installed version: $("${BINARY_PATH}" version 2>&1 | head -n 1)"

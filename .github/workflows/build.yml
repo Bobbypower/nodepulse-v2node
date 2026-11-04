@@ -1,8 +1,8 @@
 name: Build NodePulse v2node
 
 env:
-  V2NODE_REF: ad749f5220c800dc2dca65992d4b3f6864027855
-  XRAY_CORE_REF: 83ad74c463351e01c7cde391abfd9dded9e78300
+  V2NODE_REF: cf513e1f0ba5f22eef6b40e65c22e3e9856d86b2
+  XRAY_CORE_REF: e087e74a1bf25b46f2776d1a3b53a68f6018d654
 
 on:
   workflow_dispatch:
@@ -94,7 +94,7 @@ jobs:
   release:
     name: rolling-release
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout NodePulse patch repo
@@ -112,12 +112,38 @@ jobs:
         run: |
           set -euo pipefail
           cp nodepulse-v2node/ops/install-nodepulse-v2node.sh dist/install-nodepulse-v2node.sh
+          cp nodepulse-v2node/ops/install-nodepulse-edge.sh dist/install-nodepulse-edge.sh
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --exclude='__pycache__' -czf dist/nodepulse-edge-gateway.tar.gz -C nodepulse-v2node/ops edge_gateway
           (
             cd dist
-            sha256sum v2node-linux-* > SHA256SUMS
+            sha256sum v2node-linux-* nodepulse-edge-gateway.tar.gz install-nodepulse-edge.sh install-nodepulse-v2node.sh > SHA256SUMS
           )
+          python3 nodepulse-v2node/ops/build_bootstrap_bundle.py --dist dist --commit "${GITHUB_SHA}"
+
+      - name: Guard immutable bootstrap source
+        id: bootstrap_source
+        run: python3 nodepulse-v2node/ops/build_bootstrap_bundle.py --dist dist --commit "${GITHUB_SHA}" --check-published >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable bootstrap source
+        if: steps.bootstrap_source.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nodepulse-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          name: NodePulse runtime ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/v2node-*
+            dist/SHA256SUMS
+            dist/install-nodepulse-v2node.sh
+            dist/install-nodepulse-edge.sh
+            dist/nodepulse-edge-gateway.tar.gz
+            dist/bootstrap-control.tar.gz
+            dist/bootstrap-control.sha256
 
       - name: Move rolling release tag
+        if: github.ref == 'refs/heads/main'
         working-directory: nodepulse-v2node
         run: |
           set -euo pipefail
@@ -125,6 +151,7 @@ jobs:
           git push origin refs/tags/v2node-nodepulse-latest --force
 
       - name: Publish rolling release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2node-nodepulse-latest
@@ -141,3 +168,5 @@ jobs:
             dist/v2node-*
             dist/SHA256SUMS
             dist/install-nodepulse-v2node.sh
+            dist/install-nodepulse-edge.sh
+            dist/nodepulse-edge-gateway.tar.gz
